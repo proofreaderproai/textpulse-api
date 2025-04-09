@@ -589,7 +589,9 @@ def process_text(
             processed_spans_map: Dict[int, Tuple[int, str]] = {}
             temp_text_for_search = text_with_placeholders
             for term in freeze_terms_sorted:
-                term_stripped = term.strip(); if not term_stripped: continue
+                term_stripped = term.strip(); 
+                if not term_stripped: 
+                    continue
                 try:
                     pattern = re.compile(re.escape(term_stripped), re.IGNORECASE); matches_this_term = []
                     for match in pattern.finditer(temp_text_for_search):
