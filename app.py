@@ -26,7 +26,7 @@ Example: gunicorn --bind 0.0.0.0:5000 app:app (replace app with your filename)
 Ensure sufficient RAM on the server (8GB+ recommended).
 
 WARNING: Contains hardcoded API key for testing - REMOVE BEFORE SHARING/COMMIT.
-         Use environment variables or a secure configuration method in production.
+         Use environment variables or a secure configuration method in production. 123
 """
 
 # ==============================================================================
