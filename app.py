@@ -108,7 +108,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==============================================================================
 # 3. API KEY SETUP & OPENAI CLIENT INITIALIZATION
 # ==============================================================================
-# WARNING: REMOVE HARDCODED KEY. Use environment variables in production.
+
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 
 openai_client = None
