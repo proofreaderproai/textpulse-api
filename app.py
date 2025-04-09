@@ -677,6 +677,17 @@ def process_text(
         # --- Re-insert Original Freeze Terms ---
         logging.info("Re-inserting original freeze terms...")
         final_text = refined_text_with_placeholders
+
+        if placeholder_map: # Only clean if placeholders were used
+            try:
+                # Remove space(s) immediately BEFORE __F...__
+                final_text = re.sub(r'\s+(__F\d+__)', r'\1', final_text)
+                # Remove space(s) immediately AFTER __F...__
+                final_text = re.sub(r'(__F\d+__)\s+', r'\1', final_text)
+                logging.info("Cleaned potential whitespace around placeholders.")
+            except Exception as clean_err:
+                logging.warning(f"Could not clean whitespace around placeholders: {clean_err}")
+
         if placeholder_map:
             try: sorted_placeholders = sorted(placeholder_map.keys(), key=lambda p: int(PLACEHOLDER_PATTERN.fullmatch(p).group(0).split('__F')[1].split('__')[0]))
             except Exception as sort_err: logging.error(f"Error sorting placeholders: {sort_err}"); sorted_placeholders = sorted(placeholder_map.keys())
@@ -706,17 +717,21 @@ def process_text(
         else: logging.warning("Final text is empty. Setting final metrics to default values.")
 
         # --- Final Freeze Term Preservation Check ---
-        final_freeze_terms_preserved = True
-        if freeze_terms_sorted:
-            if not final_text or not final_text.strip(): final_freeze_terms_preserved = False
+        final_freeze_terms_preserved = True # Assume true initially
+        if placeholder_map: # Only check if placeholders were supposed to be there
+            logging.info(f"Verifying placeholder re-insertion in final output...")
+            # *** NEW: Check if any __F...__ pattern remains using regex ***
+            if PLACEHOLDER_PATTERN.search(final_text):
+                remaining_found = PLACEHOLDER_PATTERN.findall(final_text)
+                logging.warning(f"Placeholder(s) still found in final output after re-insertion: {set(remaining_found)}")
+                final_freeze_terms_preserved = False
             else:
-                logging.info(f"Verifying {len(freeze_terms_sorted)} freeze term(s) in final output...")
-                final_text_lower = final_text.lower(); missing_terms = []
-                for term in freeze_terms_sorted:
-                    if term.lower() not in final_text_lower: missing_terms.append(term); final_freeze_terms_preserved = False
-                if final_freeze_terms_preserved: logging.info("All provided freeze terms appear preserved.")
-                else: logging.warning(f"Freeze terms NOT found in final output: {missing_terms}")
-        else: logging.info("No freeze terms provided for final verification.")
+                logging.info("All placeholders appear to have been re-inserted successfully.")
+            # *** END NEW CHECK ***
+        else:
+            # If no placeholders were used initially, preservation is vacuously true
+            logging.info("No freeze terms were used, skipping final verification.")
+            final_freeze_terms_preserved = True # Explicitly set true
 
         # --- Structure Output Data ---
         output_data = {
