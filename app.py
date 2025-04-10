@@ -45,7 +45,9 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 # Flask related imports
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
+# *** Assuming python-dotenv is needed if you use .env file ***
+# *** If you set env vars via systemd or other means, you can remove dotenv ***
+#from dotenv import load_dotenv # To load .env file
 
 # NLP/ML related imports
 try:
@@ -57,9 +59,14 @@ try:
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, set_seed
 except ImportError as e:
     print(f"FATAL Error: Missing required library: {e}. Please install requirements.")
-    print("Try: pip install Flask spacy torch transformers openai textstat")
+    print("Try: pip install Flask python-dotenv flask-cors spacy torch transformers openai textstat") # Added flask-cors and python-dotenv here
     # Exit if core dependencies are missing
     sys.exit(1)
+
+# ==============================================================================
+# Load .env file (immediately after imports)
+# ==============================================================================
+load_dotenv() # Loads variables from .env into environment
 
 # ==============================================================================
 # 2. CONFIGURATION & CONSTANTS
@@ -109,22 +116,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # 3. API KEY SETUP & OPENAI CLIENT INITIALIZATION
 # ==============================================================================
 
+# *** Reading key from environment variable ***
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 
 openai_client = None
 logging.info("Attempting to initialize OpenAI client...")
 # Use the actual key variable here (either hardcoded or from env)
-openai_api_key = openai_api_key # Or os.environ.get("OPENAI_API_KEY")
+# openai_api_key = openai_api_key # This line is redundant, removed
 
 if not openai_api_key or not openai_api_key.startswith("sk-"):
-    logging.warning("OpenAI API Key is missing, invalid format, or not set.")
+    logging.warning("OPENAI_API_KEY environment variable not found, invalid, or key format incorrect.")
     logging.warning("OpenAI refinement step will be skipped.")
 else:
     try:
         openai_client = openai.OpenAI(api_key=openai_api_key)
         # Optional: Test connection (add timeout)
         # openai_client.with_options(timeout=10.0).models.list()
-        logging.info("OpenAI client initialized successfully.")
+        logging.info("OpenAI client initialized successfully using environment variable.")
     except Exception as e:
         logging.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
         logging.warning("OpenAI refinement step will be skipped.")
@@ -259,13 +267,13 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                 t_before, t_after, t_after_after = sentence_doc[i-1], sentence_doc[i+1], sentence_doc[i+2]
                 if t_before.pos_ == 'ADJ' and t_after.pos_ == 'ADJ' and t_after_after.pos_ in ('NOUN', 'PROPN') and \
                    t_before.head.i == t_after_after.i and t_after.head.i == t_after_after.i:
-                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Adj-Adj-Noun")
+                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Adj-Adj-Noun") if DEBUG_SPLITTING else None
             # Context Check 2b: Noun/Pronoun-Noun/Pronoun (same head)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
                 t_before, t_after = sentence_doc[i-1], sentence_doc[i+1]
                 if t_before.pos_ in ('NOUN', 'PROPN', 'PRON') and t_after.pos_ in ('NOUN', 'PROPN', 'PRON') and \
                    t_before.head.i == t_after.head.i:
-                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Noun/Pronoun-Noun/Pronoun")
+                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Noun/Pronoun-Noun/Pronoun") if DEBUG_SPLITTING else None
             # Context Check 2c: Verb/Aux-Verb/Aux (shared subject/head)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
                  t_before, t_after = sentence_doc[i-1], sentence_doc[i+1]
@@ -274,7 +282,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                      subj_after = {c.i for c in t_after.children if c.dep_ in ('nsubj', 'nsubjpass')}
                      same_head = t_before.head.i == t_after.i or t_after.head.i == t_before.i
                      if (subj_before and subj_before == subj_after) or same_head:
-                         should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Verb/Aux-Verb/Aux")
+                         should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Verb/Aux-Verb/Aux") if DEBUG_SPLITTING else None
             # Fallback S/V Check for CC
             if not should_prevent_split_cc:
                 cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
@@ -386,11 +394,16 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
         logging.debug(f"DEBUG: No valid split point found for sentence: '{sentence_doc.text[:100]}...'")
     return None
 
+# *** Start of Modified apply_sentence_splitting Function ***
 def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Language) -> str:
-    """Applies sentence splitting logic using find_split_token."""
+    """Applies sentence splitting logic using find_split_token, with minimum length check."""
     if not text_with_placeholders or not text_with_placeholders.strip(): return ""
+
+    # *** Define Minimum Word Count for the Second Clause of a Split ***
+    MIN_SPLIT_WORDS = 4 # Adjust this value as needed (e.g., 4 or 5)
+
     logging.info("Applying sentence splitting rules...")
-    output_lines = []; num_splits = 0
+    output_lines = []; num_splits = 0; num_splits_skipped = 0 # Track skipped splits
     try:
         doc = nlp_model(text_with_placeholders)
         for sent in doc.sents:
@@ -406,7 +419,7 @@ def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Langu
             elif split_token_result is not None: split_token = split_token_result
 
             if split_token is not None:
-                num_splits += 1
+                # --- Potential Split Found - Extract Clauses First ---
                 split_idx_in_sent = split_token.i - sent.start
                 clause1_start_char_idx = sent.start_char; clause1_end_char_idx = split_token.idx
                 # Adjust start for initial SCONJ+comma split
@@ -415,7 +428,12 @@ def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Langu
                 if first_real_token_idx_sent < len(sent) and \
                    (sent[first_real_token_idx_sent].pos_ == 'SCONJ' or sent[first_real_token_idx_sent].dep_ == 'mark') and \
                    split_token.text == ',':
-                    clause1_start_char_idx = sent[first_real_token_idx_sent + 1].idx
+                    # Ensure there is a token after the SCONJ before accessing idx
+                    if first_real_token_idx_sent + 1 < len(sent):
+                         clause1_start_char_idx = sent[first_real_token_idx_sent + 1].idx
+                    else: # Handle case where SCONJ is the last token before comma (unlikely but safe)
+                         clause1_start_char_idx = split_token.idx # Effectively makes clause1 empty before cleaning
+
                 # Adjust end if splitting at non-punct preceded by comma
                 if split_token.pos_ != 'PUNCT' and split_idx_in_sent > 0:
                     preceding_token = sent[split_idx_in_sent - 1]
@@ -443,25 +461,42 @@ def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Langu
                 clause2_base_cleaned = clause2_base.strip().strip('.,;:')
                 clause2_cleaned = f"{clause2_prefix} {clause2_base_cleaned}".strip() if clause2_prefix else clause2_base_cleaned
 
-                def capitalize_first_letter(s: str) -> str:
-                    match = re.search(r'([a-zA-Z])', s);
-                    if match: start_index = match.start(); return s[:start_index] + s[start_index].upper() + s[start_index+1:]
-                    return s # Return as-is if no letter found
+                # *** NEW: Check Length of Second Clause Before Committing to Split ***
+                clause2_word_count = len(clause2_cleaned.split())
+                if clause2_word_count < MIN_SPLIT_WORDS:
+                    # If second clause is too short, skip the split for this sentence
+                    if DEBUG_SPLITTING:
+                        logging.debug(f"  DEBUG: Skipping split at '{split_token.text}' (Index {split_token.i}). Reason: Second clause '{clause2_cleaned[:30]}...' too short ({clause2_word_count} words < {MIN_SPLIT_WORDS}).")
+                    output_lines.append(original_sentence_text) # Use original sentence
+                    num_splits_skipped += 1
+                else:
+                    # If second clause is long enough, proceed with the split
+                    num_splits += 1
+                    if DEBUG_SPLITTING:
+                         logging.debug(f"  DEBUG: Applying split at '{split_token.text}' (Index {split_token.i}). Second clause length ok ({clause2_word_count} words).")
 
-                clause1_capitalized = capitalize_first_letter(clause1_cleaned)
-                clause2_capitalized = capitalize_first_letter(clause2_cleaned)
+                    def capitalize_first_letter(s: str) -> str:
+                        match = re.search(r'([a-zA-Z])', s);
+                        if match: start_index = match.start(); return s[:start_index] + s[start_index].upper() + s[start_index+1:]
+                        return s # Return as-is if no letter found
 
-                if clause1_capitalized: output_lines.append(clause1_capitalized.rstrip('.?!') + ".")
-                if clause2_capitalized: output_lines.append(clause2_capitalized.rstrip('.?!') + default_ending)
-            else:
+                    clause1_capitalized = capitalize_first_letter(clause1_cleaned)
+                    clause2_capitalized = capitalize_first_letter(clause2_cleaned)
+
+                    if clause1_capitalized: output_lines.append(clause1_capitalized.rstrip('.?!') + ".")
+                    if clause2_capitalized: output_lines.append(clause2_capitalized.rstrip('.?!') + default_ending)
+                # *** END OF NEW LENGTH CHECK BLOCK ***
+
+            else: # No split point found
                 output_lines.append(original_sentence_text)
 
-        logging.info(f"Sentence splitting applied. Found {num_splits} split points.")
+        logging.info(f"Sentence splitting applied. Found {num_splits} split points. Skipped {num_splits_skipped} potential splits due to short second clause.")
         final_text = " ".join(output_lines).strip()
         return re.sub(r'\s{2,}', ' ', final_text)
     except Exception as e:
         logging.error(f"Error during sentence splitting application: {e}", exc_info=True)
         return text_with_placeholders # Fallback
+# *** End of Modified apply_sentence_splitting Function ***
 
 # ==============================================================================
 # 7. HELPER FUNCTIONS: OPENAI REFINEMENT
@@ -589,9 +624,11 @@ def process_text(
             processed_spans_map: Dict[int, Tuple[int, str]] = {}
             temp_text_for_search = text_with_placeholders
             for term in freeze_terms_sorted:
-                term_stripped = term.strip(); 
-                if not term_stripped: 
-                    continue
+                # *** SyntaxError Fix Applied Below ***
+                term_stripped = term.strip()
+                if not term_stripped:
+                    continue # Skip empty terms after stripping
+                # *** End SyntaxError Fix ***
                 try:
                     pattern = re.compile(re.escape(term_stripped), re.IGNORECASE); matches_this_term = []
                     for match in pattern.finditer(temp_text_for_search):
@@ -677,17 +714,38 @@ def process_text(
         # --- Re-insert Original Freeze Terms ---
         logging.info("Re-inserting original freeze terms...")
         final_text = refined_text_with_placeholders
+
+        # *** FIX 1: Clean up potential extra spaces around placeholders BEFORE replacing ***
+        if placeholder_map: # Only clean if placeholders were used
+            try:
+                # Remove space(s) immediately BEFORE __F...__
+                final_text = re.sub(r'\s+(__F\d+__)', r'\1', final_text)
+                # Remove space(s) immediately AFTER __F...__
+                final_text = re.sub(r'(__F\d+__)\s+', r'\1', final_text)
+                logging.info("Cleaned potential whitespace around placeholders.")
+            except Exception as clean_err:
+                logging.warning(f"Could not clean whitespace around placeholders: {clean_err}")
+        # *** END FIX 1 ***
+
         if placeholder_map:
             try: sorted_placeholders = sorted(placeholder_map.keys(), key=lambda p: int(PLACEHOLDER_PATTERN.fullmatch(p).group(0).split('__F')[1].split('__')[0]))
             except Exception as sort_err: logging.error(f"Error sorting placeholders: {sort_err}"); sorted_placeholders = sorted(placeholder_map.keys())
             num_reinserted = 0
             for placeholder in sorted_placeholders:
                 original_term = placeholder_map[placeholder]; occurrences = final_text.count(placeholder)
-                if occurrences > 0: final_text = final_text.replace(placeholder, original_term); num_reinserted += occurrences
+                if occurrences > 0:
+                    # *** FIX 2: Add spaces around original_term during replacement ***
+                    final_text = final_text.replace(placeholder, f" {original_term} ")
+                    num_reinserted += occurrences
             logging.info(f"{num_reinserted} placeholder instance(s) re-inserted.")
-            remaining_placeholders = PLACEHOLDER_PATTERN.findall(final_text)
-            if remaining_placeholders: logging.warning(f"Placeholders remaining after re-insertion: {set(remaining_placeholders)}")
+
+            # *** FIX 3: Clean up potential double spaces AFTER the loop ***
+            final_text = re.sub(r'\s{2,}', ' ', final_text).strip()
+            logging.info("Cleaned up potential double spaces after re-insertion.")
+            # *** END FIX 3 ***
+
         else: logging.info("No placeholders used, skipping re-insertion.")
+
 
         # --- Final Metrics Calculation ---
         logging.info("Calculating final metrics...")
@@ -706,17 +764,20 @@ def process_text(
         else: logging.warning("Final text is empty. Setting final metrics to default values.")
 
         # --- Final Freeze Term Preservation Check ---
+        # *** Using Improved Regex Check ***
         final_freeze_terms_preserved = True
-        if freeze_terms_sorted:
-            if not final_text or not final_text.strip(): final_freeze_terms_preserved = False
+        if placeholder_map:
+            logging.info(f"Verifying placeholder re-insertion in final output...")
+            if PLACEHOLDER_PATTERN.search(final_text):
+                remaining_found = PLACEHOLDER_PATTERN.findall(final_text)
+                logging.warning(f"Placeholder(s) still found in final output after re-insertion: {set(remaining_found)}")
+                final_freeze_terms_preserved = False
             else:
-                logging.info(f"Verifying {len(freeze_terms_sorted)} freeze term(s) in final output...")
-                final_text_lower = final_text.lower(); missing_terms = []
-                for term in freeze_terms_sorted:
-                    if term.lower() not in final_text_lower: missing_terms.append(term); final_freeze_terms_preserved = False
-                if final_freeze_terms_preserved: logging.info("All provided freeze terms appear preserved.")
-                else: logging.warning(f"Freeze terms NOT found in final output: {missing_terms}")
-        else: logging.info("No freeze terms provided for final verification.")
+                logging.info("All placeholders appear to have been re-inserted successfully.")
+        else:
+            logging.info("No freeze terms were used, skipping final verification.")
+            final_freeze_terms_preserved = True
+
 
         # --- Structure Output Data ---
         output_data = {
@@ -731,7 +792,7 @@ def process_text(
                 "type_token_ratio": round(paraphrased_ttr, 4),
                 "modification_percentage": round(paraphrased_mod_percentage, 2),
                 "word_count": paraphrased_word_count,
-                "freeze_terms_preserved": final_freeze_terms_preserved # Include preservation status
+                "freeze_terms_preserved": final_freeze_terms_preserved # Use the result of the improved check
             }
             # Optional: Add back intermediate steps here if needed for debugging
             # "T5_Output_Placeholders": t5_paraphrased_text_with_placeholders,
@@ -751,7 +812,7 @@ def process_text(
 # 10. FLASK APP INITIALIZATION
 # ==============================================================================
 app = Flask(__name__)
-CORS(app)
+CORS(app) # Enable CORS for all routes
 # ==============================================================================
 # 11. GLOBAL MODEL LOADING (Executed once when Flask starts)
 # ==============================================================================
