@@ -66,7 +66,7 @@ except ImportError as e:
 # ==============================================================================
 # Load .env file (immediately after imports)
 # ==============================================================================
-load_dotenv() # Loads variables from .env into environment
+#load_dotenv() # Loads variables from .env into environment
 
 # ==============================================================================
 # 2. CONFIGURATION & CONSTANTS
