@@ -400,7 +400,7 @@ def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Langu
     if not text_with_placeholders or not text_with_placeholders.strip(): return ""
 
     # *** Define Minimum Word Count for the Second Clause of a Split ***
-    MIN_SPLIT_WORDS = 4 # Adjust this value as needed (e.g., 4 or 5)
+    MIN_SPLIT_WORDS = 6 # Adjust this value as needed (e.g., 4 or 5)
 
     logging.info("Applying sentence splitting rules...")
     output_lines = []; num_splits = 0; num_splits_skipped = 0 # Track skipped splits
