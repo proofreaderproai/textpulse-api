@@ -277,6 +277,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                          #logging.info(f"--> Scenario 1 or 2 DETECTED: Skipping split at target SCONJ '{token.text}' because preceded by {prev_pos}.")
                          continue
                      else:
+                         pass
                           #logging.info(f"--> Preceding token '{prev_token.text}' ({prev_pos}) OK, allowing potential split at target SCONJ '{token.text}'.")
                  #logging.info(f"--> Returning SCONJ '{token.text}' (idx {i}) as split point (passed S+V and context checks).")
                  return token
