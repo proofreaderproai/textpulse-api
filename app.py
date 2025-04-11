@@ -830,8 +830,15 @@ else:
 # ==============================================================================
 # 12. FLASK API ENDPOINT
 # ==============================================================================
-@app.route('/humanize', methods=['POST'])
+
+@app.route('/', methods=['GET', 'POST'])
 def index():
+    if request.method == 'POST':
+        return 'POST received!'
+    return 'GET received!'
+
+@app.route('/humanize', methods=['POST'])
+def humanize_endpoint():
     """API endpoint to process text."""
     start_request_time = time.time()
     logging.info(f"Received request for /humanize from {request.remote_addr}")
