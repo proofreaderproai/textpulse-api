@@ -41,6 +41,7 @@ import re
 import traceback # For detailed error logging
 from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional, Tuple, Union
+from flask_caching import Cache
 
 # Flask related imports
 from flask import Flask, request, jsonify
@@ -944,6 +945,11 @@ else:
 # ==============================================================================
 # 12. FLASK API ENDPOINT
 # ==============================================================================
+
+@app.route("/clear-cache")
+def clear_cache():
+    cache.clear()
+    return "Cache cleared!"
 
 @app.route('/', methods=['POST'])
 def index():
