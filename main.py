@@ -225,111 +225,171 @@ def has_subject_and_verb(doc_span: spacy.tokens.Span) -> bool:
     return span_has_verb and span_has_subj
 
 def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.tokens.Token, Tuple[spacy.tokens.Token, Dict]]]:
-    """Finds the first valid token where a sentence can be split based on prioritized rules."""
+    """
+    Finds the first valid token where a sentence can be split based on prioritized rules.
+    Includes targeted checks within Rule 2.1 (SCONJ) and Rule 2.2 (CCONJ).
+    """
+    global DEBUG_SPLITTING
+
     conjunctive_adverbs = {'however', 'therefore', 'moreover', 'consequently', 'thus', 'furthermore', 'nevertheless', 'instead', 'otherwise', 'accordingly', 'subsequently', 'hence'}
-    dash_chars = {'-', '—', '–'}; sent_len = len(sentence_doc)
+    dash_chars = {'-', '—', '–'}
+    sent_len = len(sentence_doc)
     if DEBUG_SPLITTING: logging.debug(f"\nDEBUG Split Check: '{sentence_doc.text[:100]}...'")
+
+    interrogative_explanatory_sconjs = {'how', 'if', 'whether', 'why', 'when', 'where'}
+    preventing_prev_pos_for_target_sconj = {'VERB', 'SCONJ', 'ADP', 'PREP'}
 
     # --- Pass 1: Prioritize Semicolon ---
     if DEBUG_SPLITTING: logging.debug(f"--- Splitting Pass 1: Checking for Semicolon ---")
     for i, token in enumerate(sentence_doc):
         if token.text == ';':
-            if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' at index {i}. Checking S/V around it.")
-            cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
-            if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
-                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Priority) - Splitting at ';' (Index {i}) based on S/V check.")
-                return token
-            else:
-                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' (Index {i}) but FAILED S/V check around it. Ignoring this semicolon.")
-                break # Stop checking semicolons in this priority pass
+             if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' at index {i}. Checking S/V around it.")
+             cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
+             if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
+                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Priority) - Splitting at ';' (Index {i}) based on S/V check.")
+                 return token
+             else:
+                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' (Index {i}) but FAILED S/V check around it. Ignoring this semicolon.")
 
     # --- Pass 2: Check Other Rules ---
     if DEBUG_SPLITTING: logging.debug(f"--- Splitting Pass 2: Checking Other Rules ---")
     for i, token in enumerate(sentence_doc):
         if PLACEHOLDER_PATTERN.fullmatch(token.text): continue
         if i == 0 or i >= sent_len - 1: continue
+
         is_cc = (token.dep_ == "cc" and token.pos_ == "CCONJ")
         is_mid_sconj = (token.pos_ == 'SCONJ' or token.dep_ == 'mark') and i > 0
-        is_comma = (token.text == ','); is_dash = (token.text in dash_chars); is_colon = (token.text == ':')
+        is_comma = (token.text == ',')
+        is_dash = (token.text in dash_chars)
+        is_colon = (token.text == ':')
 
         # Rule 2.1: Mid-Sentence SCONJ
         if is_mid_sconj:
-             cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
+             cl1_span = sentence_doc[0 : i]
+             cl2_span = sentence_doc[i + 1 : sent_len]
              if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
-                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at SCONJ '{token.text}' (Index {i}) based on S/V check.")
+                 is_target_sconj = token.lower_ in interrogative_explanatory_sconjs
+                 if is_target_sconj and i > 0:
+                     prev_token = sentence_doc[i-1]
+                     prev_pos = prev_token.pos_
+                     #logging.info(f"TARGETED SCONJ CHECK for '{token.text}' (idx {i}): Preceded by '{prev_token.text}' (pos='{prev_pos}')")
+                     if prev_pos in preventing_prev_pos_for_target_sconj:
+                         #logging.info(f"--> Scenario 1 or 2 DETECTED: Skipping split at target SCONJ '{token.text}' because preceded by {prev_pos}.")
+                         continue
+                     else:
+                          #logging.info(f"--> Preceding token '{prev_token.text}' ({prev_pos}) OK, allowing potential split at target SCONJ '{token.text}'.")
+                 #logging.info(f"--> Returning SCONJ '{token.text}' (idx {i}) as split point (passed S+V and context checks).")
                  return token
 
-        # Rule 2.2: CCONJ with Context Checks
+        # Rule 2.2: CCONJ (e.g., and, but, or) with Context Checks
         elif is_cc:
             should_prevent_split_cc = False
-            # Context Check 2a: Adj-Adj-Noun
+
+            # Context Check 2a: Adj-Adj-Noun (e.g., "red, white, and blue")
             if i > 0 and i < sent_len - 2:
-                t_before, t_after, t_after_after = sentence_doc[i-1], sentence_doc[i+1], sentence_doc[i+2]
+                t_before = sentence_doc[i-1]; t_after = sentence_doc[i+1]; t_after_after = sentence_doc[i+2]
                 if t_before.pos_ == 'ADJ' and t_after.pos_ == 'ADJ' and t_after_after.pos_ in ('NOUN', 'PROPN') and \
                    t_before.head.i == t_after_after.i and t_after.head.i == t_after_after.i:
-                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Adj-Adj-Noun") if DEBUG_SPLITTING else None
-            # Context Check 2b: Noun/Pronoun-Noun/Pronoun (same head)
+                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2a): Adj-Adj-Noun") if DEBUG_SPLITTING else None
+
+            # *** NEW Context Check 2b: Noun/Gerund Coordination ***
+            # Checks for patterns like "noun/propn + 'and' + noun/propn/verb(gerund)" where the second is a conjunct of the first.
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                t_before, t_after = sentence_doc[i-1], sentence_doc[i+1]
+                t_before = sentence_doc[i-1]
+                t_after = sentence_doc[i+1]
+                noun_like_pos = {'NOUN', 'PROPN'}
+                noun_gerund_like_pos = {'NOUN', 'PROPN', 'VERB'} # spaCy tags gerunds as VERB
+                try:
+                    # Check POS tags and dependency relation 'conj'
+                    if (t_before.pos_ in noun_like_pos and
+                        t_after.pos_ in noun_gerund_like_pos and
+                        t_after.dep_ == 'conj' and
+                        t_after.head.i == t_before.i):
+                         should_prevent_split_cc = True
+                         #logging.info(f"--> CC Prevent Heuristic (2b): Likely Noun/Gerund coordination ('{t_before.text} and {t_after.text}'). Skipping split at '{token.text}'.")
+                except AttributeError:
+                    # Handle cases where attributes might be missing (less likely for standard tokens)
+                    logging.warning(f"Attribute error during CC context check 2b near index {i}")
+
+
+            # Context Check 2c (Old 2b): Noun/Pronoun-Noun/Pronoun (same head - broader check)
+            if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
+                t_before = sentence_doc[i-1]; t_after = sentence_doc[i+1]
                 if t_before.pos_ in ('NOUN', 'PROPN', 'PRON') and t_after.pos_ in ('NOUN', 'PROPN', 'PRON') and \
                    t_before.head.i == t_after.head.i:
-                    should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Noun/Pronoun-Noun/Pronoun") if DEBUG_SPLITTING else None
-            # Context Check 2c: Verb/Aux-Verb/Aux (shared subject/head)
+                   # Added check: only prevent if head is NOT a verb (avoid interfering with clause coordination)
+                   if t_before.head.pos_ not in ('VERB', 'AUX'):
+                       should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2c): Noun/Pronoun-Noun/Pronoun same non-verb head") if DEBUG_SPLITTING else None
+
+
+            # Context Check 2d (Old 2c): Verb/Aux-Verb/Aux (shared subject/head)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                 t_before, t_after = sentence_doc[i-1], sentence_doc[i+1]
+                 t_before = sentence_doc[i-1]; t_after = sentence_doc[i+1]
                  if t_before.pos_ in ('VERB', 'AUX') and t_after.pos_ in ('VERB', 'AUX'):
                      subj_before = {c.i for c in t_before.children if c.dep_ in ('nsubj', 'nsubjpass')}
                      subj_after = {c.i for c in t_after.children if c.dep_ in ('nsubj', 'nsubjpass')}
-                     same_head = t_before.head.i == t_after.i or t_after.head.i == t_before.i
-                     if (subj_before and subj_before == subj_after) or same_head:
-                         should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent: Verb/Aux-Verb/Aux") if DEBUG_SPLITTING else None
-            # Fallback S/V Check for CC
+                     verbs_share_subject = bool(subj_before and subj_before == subj_after)
+                     # Check if they share a head OR if one is auxiliary modifier of other etc.
+                     verbs_share_head = (t_before.head.i == t_after.i or
+                                         t_after.head.i == t_before.i or
+                                         t_before.head.i == t_after.head.i or
+                                         t_before.dep_ == 'aux' and t_before.head.i == t_after.i or
+                                         t_after.dep_ == 'aux' and t_after.head.i == t_before.i)
+                     if verbs_share_subject or verbs_share_head:
+                         should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2d): Verb/Aux-Verb/Aux (Shared Subj or Head/Aux)") if DEBUG_SPLITTING else None
+
+            # Fallback S/V Check for CC if no context rule prevented it
             if not should_prevent_split_cc:
-                cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
-                if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
+                cl1_span_cc = sentence_doc[0 : i]; cl2_span_cc = sentence_doc[i + 1 : sent_len]
+                if cl1_span_cc and cl2_span_cc and has_subject_and_verb(cl1_span_cc) and has_subject_and_verb(cl2_span_cc):
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at CC '{token.text}' (Index {i}) based on S/V check.")
                     return token
                 elif DEBUG_SPLITTING: logging.debug(f"    DEBUG CC Fallback S/V check FAILED for '{token.text}' (Index {i}).")
-            elif DEBUG_SPLITTING: logging.debug(f"  DEBUG: Skipping CCONJ '{token.text}' (Index {i}) due to context rule.")
+            elif DEBUG_SPLITTING: logging.debug(f"  DEBUG: Skipping CCONJ '{token.text}' (Index {i}) due to context rule (2a, 2b, 2c, or 2d).")
+
 
         # Rule 2.3: Comma + Conjunctive Adverb
         elif is_comma and i < sent_len - 1:
+             # ... (Existing Rule 2.3 logic - unchanged) ...
             t_after_idx = i + 1
             while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
             if t_after_idx >= sent_len : continue
             t_after = sentence_doc[t_after_idx]
             if t_after.lower_ in conjunctive_adverbs and t_after.pos_ == 'ADV':
-                cl1_span = sentence_doc[0 : i]; cl2_span_start_idx = t_after_idx + 1
-                cl2_span = sentence_doc[cl2_span_start_idx : sent_len] if cl2_span_start_idx < sent_len else None
-                if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
+                cl1_span_conj = sentence_doc[0 : i]; cl2_span_start_idx = t_after_idx + 1
+                cl2_span_conj = sentence_doc[cl2_span_start_idx : sent_len] if cl2_span_start_idx < sent_len else None
+                if cl1_span_conj and cl2_span_conj and has_subject_and_verb(cl1_span_conj) and has_subject_and_verb(cl2_span_conj):
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ',' (Index {i}) based on Conj. Adverb '{t_after.text}'.")
                     return token
 
         # Rule 2.4: Comma + Relative 'which'
         elif is_comma and i < sent_len - 1:
+            # ... (Existing Rule 2.4 logic - unchanged) ...
             t_after_idx = i + 1
             while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
             if t_after_idx >= sent_len : continue
             t_after = sentence_doc[t_after_idx]
             if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('nsubj', 'nsubjpass', 'dobj'):
-                cl1_span = sentence_doc[0 : i]; cl2_check_start_idx = t_after_idx + 1
+                cl1_span_which = sentence_doc[0 : i]; cl2_check_start_idx = t_after_idx + 1
                 cl2_check_span = sentence_doc[cl2_check_start_idx : sent_len] if cl2_check_start_idx < sent_len else None
-                if cl1_span and cl2_check_span and has_subject_and_verb(cl1_span) and \
+                if cl1_span_which and cl2_check_span and has_subject_and_verb(cl1_span_which) and \
                    any(t.pos_ in ("VERB", "AUX") for t in cl2_check_span if not PLACEHOLDER_PATTERN.fullmatch(t.text)):
-                    antecedent = t_after.head; pronoun = "It"
+                    antecedent = t_after.head ; pronoun = "It"
                     try:
                         morph_num = antecedent.morph.get('Number')
                         if morph_num and 'Plur' in morph_num: pronoun = "They"
                         elif antecedent.pos_ == 'NOUN' and antecedent.text.lower().endswith('s') and not morph_num:
                              singular_form = antecedent.lemma_
                              if singular_form != antecedent.text.lower(): pronoun = "They"
-                    except Exception: pass # Ignore morph errors
+                    except Exception: pass
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ',' (Index {i}) based on Relative Clause 'which'. Antecedent='{antecedent.text}', Pronoun='{pronoun}'.")
                     return (token, {'type': 'relative_which', 'pronoun': pronoun, 'replace_token': t_after})
 
+
         # Rule 2.5: Potential Comma Splice
         elif is_comma:
-            is_handled_by_prior_rule = False # Check if handled by 2.3 or 2.4
+             # ... (Existing Rule 2.5 logic - unchanged) ...
+            is_handled_by_prior_rule = False
             if i < sent_len - 1:
                 t_after_idx = i + 1
                 while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
@@ -338,161 +398,214 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                     if t_after.lower_ in conjunctive_adverbs and t_after.pos_ == 'ADV': is_handled_by_prior_rule = True
                     if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('nsubj','nsubjpass', 'dobj'): is_handled_by_prior_rule = True
             if not is_handled_by_prior_rule:
-                cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
-                if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
+                cl1_span_comma = sentence_doc[0 : i]; cl2_span_comma = sentence_doc[i + 1 : sent_len]
+                if cl1_span_comma and cl2_span_comma and has_subject_and_verb(cl1_span_comma) and has_subject_and_verb(cl2_span_comma):
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ',' (Index {i}). Reason: Potential Comma Splice (S/V + S/V).")
                     return token
 
+
         # Rule 2.6: Dashes
         elif is_dash:
-            is_compound_word_hyphen = False
-            if i > 0 and i < sent_len - 1:
-                prev_token, next_token = sentence_doc[i-1], sentence_doc[i+1]
-                if prev_token.idx + len(prev_token.text) == token.idx and \
-                   token.idx + len(token.text) == next_token.idx and \
-                   prev_token.is_alpha and next_token.is_alpha:
-                    is_compound_word_hyphen = True
-            if not is_compound_word_hyphen:
-                cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
-                if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
-                    if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at dash '{token.text}' (Index {i}) based on S/V check.")
-                    return token
+            # ... (Existing Rule 2.6 logic - unchanged) ...
+             is_compound_word_hyphen = False
+             if i > 0 and i < sent_len - 1:
+                 prev_token, next_token = sentence_doc[i-1], sentence_doc[i+1]
+                 if prev_token.idx + len(prev_token.text) == token.idx and \
+                    token.idx + len(token.text) == next_token.idx and \
+                    prev_token.is_alpha and next_token.is_alpha:
+                     is_compound_word_hyphen = True
+             if not is_compound_word_hyphen:
+                 cl1_span_dash = sentence_doc[0 : i]; cl2_span_dash = sentence_doc[i + 1 : sent_len]
+                 if cl1_span_dash and cl2_span_dash and has_subject_and_verb(cl1_span_dash) and has_subject_and_verb(cl2_span_dash):
+                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at dash '{token.text}' (Index {i}) based on S/V check.")
+                     return token
+
 
         # Rule 2.7: Colons
         elif is_colon :
-            cl1_span = sentence_doc[0:i]; cl2_span = sentence_doc[i+1:sent_len]
-            if cl2_span and has_subject_and_verb(cl2_span):
-                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ':' (Index {i}) based on S/V check in second clause.")
-                return token
+            # ... (Existing Rule 2.7 logic - unchanged) ...
+             cl1_span_colon = sentence_doc[0:i]; cl2_span_colon = sentence_doc[i+1:sent_len]
+             if cl2_span_colon and has_subject_and_verb(cl2_span_colon):
+                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ':' (Index {i}) based on S/V check in second clause.")
+                 return token
+
 
     # --- Rule 2.8: Initial SCONJ + Comma ---
+    # ... (Existing Rule 2.8 logic - unchanged) ...
     first_real_token_idx = 0
     while first_real_token_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[first_real_token_idx].text): first_real_token_idx += 1
     if first_real_token_idx < sent_len and (sentence_doc[first_real_token_idx].pos_ == 'SCONJ' or sentence_doc[first_real_token_idx].dep_ == 'mark'):
         initial_sconj_token = sentence_doc[first_real_token_idx]
-        if DEBUG_SPLITTING: logging.debug(f"--- Splitting Pass 3: Checking for Initial SCONJ '{initial_sconj_token.text}' + Comma ---")
-        for i, token in enumerate(sentence_doc):
-            if token.i <= first_real_token_idx: continue
-            if PLACEHOLDER_PATTERN.fullmatch(token.text): continue
-            if token.text == ',':
-                cl1_check_span = sentence_doc[first_real_token_idx + 1 : i]
-                cl2_span = sentence_doc[i + 1 : sent_len]
-                if cl1_check_span and cl2_span and has_subject_and_verb(cl1_check_span) and has_subject_and_verb(cl2_span):
-                    is_which_case = False # Avoid splitting if handled by Rule 2.4
-                    next_real_token_idx = i + 1
+        if DEBUG_SPLITTING: logging.debug(f"--- Splitting Rule 2.8: Checking for Initial SCONJ '{initial_sconj_token.text}' + Comma ---")
+        comma_found = False
+        for i_rule28, token_rule28 in enumerate(sentence_doc): # Use different loop variables
+            if token_rule28.i <= first_real_token_idx: continue
+            if PLACEHOLDER_PATTERN.fullmatch(token_rule28.text): continue
+            if token_rule28.text == ',':
+                comma_found = True
+                cl1_check_span_rule28 = sentence_doc[first_real_token_idx + 1 : i_rule28]
+                cl2_span_rule28 = sentence_doc[i_rule28 + 1 : sent_len]
+                if cl1_check_span_rule28 and cl2_span_rule28 and has_subject_and_verb(cl1_check_span_rule28) and has_subject_and_verb(cl2_span_rule28):
+                    is_which_case = False
+                    next_real_token_idx = i_rule28 + 1
                     while next_real_token_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[next_real_token_idx].text): next_real_token_idx += 1
                     if next_real_token_idx < sent_len:
                         next_real_token = sentence_doc[next_real_token_idx]
                         if next_real_token.lower_=='which' and next_real_token.tag_=='WDT': is_which_case=True
                     if not is_which_case:
-                        if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 3) - Splitting at ',' (Index {i}) following initial SCONJ '{initial_sconj_token.text}'.")
-                        return token
-                break # Only check first comma after initial SCONJ
+                        if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Rule 2.8) - Splitting at ',' (Index {i_rule28}) following initial SCONJ '{initial_sconj_token.text}'.")
+                        return token_rule28
+                break
 
-    # --- No split point found ---
+
+    # --- No split point found by any rule ---
     if DEBUG_SPLITTING and sent_len > 10:
         logging.debug(f"DEBUG: No valid split point found for sentence: '{sentence_doc.text[:100]}...'")
     return None
 
+
+
+
+
+
 # *** Start of Modified apply_sentence_splitting Function ***
 def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Language) -> str:
-    """Applies sentence splitting logic using find_split_token, with minimum length check."""
+    """
+    Applies sentence splitting logic using find_split_token.
+    Includes checks to prevent splits if:
+    - The second clause starts with a dependent marker (how, why, if, etc.).
+    - Either resulting clause is too short (MIN_SPLIT_WORDS).
+    """
+    # Ensure DEBUG_SPLITTING is accessible, or pass it as an argument if needed
+    global DEBUG_SPLITTING # Make sure it's accessible or remove if passed
+
     if not text_with_placeholders or not text_with_placeholders.strip(): return ""
 
-    # *** Define Minimum Word Count for the Second Clause of a Split ***
-    MIN_SPLIT_WORDS = 7 # Adjust this value as needed (e.g., 4 or 5)
+    # *** Define Minimum Word Count - SET THIS APPROPRIATELY (e.g., 6 or 7) ***
+    MIN_SPLIT_WORDS = 7 # Using 7 for safety, adjust as needed
+
+    # *** Define common words that start dependent clauses ***
+    # Using lowercase and requiring a following space for better matching
+    dependent_clause_starters = {
+        'how ', 'why ', 'if ', 'whether ', 'when ', 'where ', 'because ',
+        'although ', 'though ', 'while ', 'since ', 'unless ', 'until ',
+        'as ', 'after ', 'before ', 'so that ', 'such that ', 'whenever ',
+        'wherever ', 'whereas '
+        # Note: 'that' can be ambiguous, omitted for now. Add if needed.
+    }
+
+
+    # *** ADDED LOGGING: Log input to this function ***
+    logging.info(f"APPLY_SENTENCE_SPLITTING INPUT (first 500 chars): >>>{text_with_placeholders[:500]}<<<")
 
     logging.info("Applying sentence splitting rules...")
     output_lines = []; num_splits = 0; num_splits_skipped = 0 # Track skipped splits
     try:
         doc = nlp_model(text_with_placeholders)
-        for sent in doc.sents:
+        for sent_idx, sent in enumerate(doc.sents): # Added index for logging
             original_sentence_text = sent.text
             if not original_sentence_text.strip(): continue
+
+            if DEBUG_SPLITTING: logging.debug(f"\nProcessing Sent #{sent_idx}: '{original_sentence_text[:100]}...'")
+
             original_ends_with_question = original_sentence_text.strip().endswith('?')
             original_ends_with_exclamation = original_sentence_text.strip().endswith('!')
             default_ending = "?" if original_ends_with_question else "!" if original_ends_with_exclamation else "."
 
-            split_token_result = find_split_token(sent)
+            split_token_result = find_split_token(sent) # Use the find_split_token with dependency/heuristic checks
             split_details, split_token = None, None
             if isinstance(split_token_result, tuple): split_token, split_details = split_token_result
             elif split_token_result is not None: split_token = split_token_result
 
             if split_token is not None:
                 # --- Potential Split Found - Extract Clauses First ---
+                # (Clause extraction logic remains the same as previous versions)
                 split_idx_in_sent = split_token.i - sent.start
                 clause1_start_char_idx = sent.start_char; clause1_end_char_idx = split_token.idx
-                # Adjust start for initial SCONJ+comma split
                 first_real_token_idx_sent = 0
                 while first_real_token_idx_sent < len(sent) and PLACEHOLDER_PATTERN.fullmatch(sent[first_real_token_idx_sent].text): first_real_token_idx_sent += 1
                 if first_real_token_idx_sent < len(sent) and \
                    (sent[first_real_token_idx_sent].pos_ == 'SCONJ' or sent[first_real_token_idx_sent].dep_ == 'mark') and \
                    split_token.text == ',':
-                    # Ensure there is a token after the SCONJ before accessing idx
-                    if first_real_token_idx_sent + 1 < len(sent):
-                         clause1_start_char_idx = sent[first_real_token_idx_sent + 1].idx
-                    else: # Handle case where SCONJ is the last token before comma (unlikely but safe)
-                         clause1_start_char_idx = split_token.idx # Effectively makes clause1 empty before cleaning
-
-                # Adjust end if splitting at non-punct preceded by comma
+                    if first_real_token_idx_sent + 1 < len(sent): clause1_start_char_idx = sent[first_real_token_idx_sent + 1].idx
+                    else: clause1_start_char_idx = split_token.idx
                 if split_token.pos_ != 'PUNCT' and split_idx_in_sent > 0:
                     preceding_token = sent[split_idx_in_sent - 1]
                     if preceding_token.text == ',': clause1_end_char_idx = preceding_token.idx
                 clause1_raw_text = doc.text[clause1_start_char_idx:clause1_end_char_idx]
 
                 clause2_start_char_idx = split_token.idx + len(split_token.text); clause2_end_char_idx = sent.end_char; clause2_prefix = ""
-                # Handle 'relative_which' reconstruction
                 if split_details and split_details.get('type') == 'relative_which':
                     replace_token = split_details['replace_token']
                     clause2_start_char_idx = replace_token.idx + len(replace_token.text)
                     clause2_prefix = split_details['pronoun']
-                # Handle comma + conjunctive adverb reconstruction
                 elif split_token.text == ',' and (split_token.i + 1) < sent.end:
                     next_token_idx = split_token.i + 1
                     while next_token_idx < sent.end and PLACEHOLDER_PATTERN.fullmatch(sent.doc[next_token_idx].text): next_token_idx+=1
                     if next_token_idx < sent.end:
-                        next_token = sent.doc[next_token_idx]
-                        conjunctive_adverbs_local = {'however', 'therefore', 'moreover', 'consequently', 'thus', 'furthermore', 'nevertheless', 'instead', 'otherwise', 'accordingly', 'subsequently', 'hence'}
-                        if next_token.lower_ in conjunctive_adverbs_local and next_token.pos_ == 'ADV':
-                            clause2_start_char_idx = next_token.idx + len(next_token.text)
+                         next_token = sent.doc[next_token_idx]
+                         conjunctive_adverbs_local = {'however', 'therefore', 'moreover', 'consequently', 'thus', 'furthermore', 'nevertheless', 'instead', 'otherwise', 'accordingly', 'subsequently', 'hence'}
+                         if next_token.lower_ in conjunctive_adverbs_local and next_token.pos_ == 'ADV':
+                             clause2_start_char_idx = next_token.idx + len(next_token.text)
                 clause2_base = doc.text[clause2_start_char_idx:clause2_end_char_idx]
 
                 clause1_cleaned = clause1_raw_text.strip().strip('.,;:')
                 clause2_base_cleaned = clause2_base.strip().strip('.,;:')
                 clause2_cleaned = f"{clause2_prefix} {clause2_base_cleaned}".strip() if clause2_prefix else clause2_base_cleaned
 
-                # *** NEW: Check Length of Second Clause Before Committing to Split ***
-                clause2_word_count = len(clause2_cleaned.split())
-                if clause2_word_count < MIN_SPLIT_WORDS:
-                    # If second clause is too short, skip the split for this sentence
-                    if DEBUG_SPLITTING:
-                        logging.debug(f"  DEBUG: Skipping split at '{split_token.text}' (Index {split_token.i}). Reason: Second clause '{clause2_cleaned[:30]}...' too short ({clause2_word_count} words < {MIN_SPLIT_WORDS}).")
-                    output_lines.append(original_sentence_text) # Use original sentence
+                # --- Calculate Word Counts (excluding placeholders) ---
+                clause1_word_count = len([word for word in clause1_cleaned.split() if not PLACEHOLDER_PATTERN.fullmatch(word)])
+                clause2_word_count = len([word for word in clause2_cleaned.split() if not PLACEHOLDER_PATTERN.fullmatch(word)])
+
+                # *** ADDED LOGGING: Log values before decision ***
+                logging.info(f"SPLIT CHECK (Sent #{sent_idx}): Token='{split_token.text}' @ index {split_token.i}, "
+                             f"C1 words={clause1_word_count} ('{clause1_cleaned[:30]}...'), "
+                             f"C2 words={clause2_word_count} ('{clause2_cleaned[:30]}...'), "
+                             f"MIN_SPLIT={MIN_SPLIT_WORDS}")
+
+                # --- Check if Clause 2 starts with a dependent marker ---
+                starts_with_dependent = False
+                clause2_lower = clause2_cleaned.lower() # Check lowercase
+                for starter in dependent_clause_starters:
+                    if clause2_lower.startswith(starter):
+                        starts_with_dependent = True
+                        break # Found one, no need to check others
+
+                # --- Decision Logic ---
+                if not clause1_cleaned or not clause2_cleaned:
+                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Skipping (Empty Clause)")
+                    output_lines.append(original_sentence_text)
+                    num_splits_skipped += 1
+                elif starts_with_dependent: # <<< CHECK ADDED HERE
+                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Skipping (Clause 2 starts with dependent marker: '{clause2_cleaned[:30]}...')")
+                    output_lines.append(original_sentence_text)
+                    num_splits_skipped += 1
+                elif clause1_word_count < MIN_SPLIT_WORDS or clause2_word_count < MIN_SPLIT_WORDS:
+                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Skipping (Too Short: {clause1_word_count} < {MIN_SPLIT_WORDS} or {clause2_word_count} < {MIN_SPLIT_WORDS})")
+                    output_lines.append(original_sentence_text)
                     num_splits_skipped += 1
                 else:
-                    # If second clause is long enough, proceed with the split
+                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Proceeding with Split")
                     num_splits += 1
-                    if DEBUG_SPLITTING:
-                         logging.debug(f"  DEBUG: Applying split at '{split_token.text}' (Index {split_token.i}). Second clause length ok ({clause2_word_count} words).")
-
+                    # Capitalization and Appending Logic...
                     def capitalize_first_letter(s: str) -> str:
-                        match = re.search(r'([a-zA-Z])', s);
-                        if match: start_index = match.start(); return s[:start_index] + s[start_index].upper() + s[start_index+1:]
-                        return s # Return as-is if no letter found
-
+                       match = re.search(r'([a-zA-Z])', s);
+                       if match: start_index = match.start(); return s[:start_index] + s[start_index].upper() + s[start_index+1:]
+                       return s
                     clause1_capitalized = capitalize_first_letter(clause1_cleaned)
                     clause2_capitalized = capitalize_first_letter(clause2_cleaned)
-
                     if clause1_capitalized: output_lines.append(clause1_capitalized.rstrip('.?!') + ".")
                     if clause2_capitalized: output_lines.append(clause2_capitalized.rstrip('.?!') + default_ending)
-                # *** END OF NEW LENGTH CHECK BLOCK ***
 
-            else: # No split point found
+            else: # No split point found by find_split_token
+                if DEBUG_SPLITTING: logging.debug(f"No split point found for Sent #{sent_idx}.")
                 output_lines.append(original_sentence_text)
 
-        logging.info(f"Sentence splitting applied. Found {num_splits} split points. Skipped {num_splits_skipped} potential splits due to short second clause.")
+        logging.info(f"Sentence splitting applied. Performed {num_splits} splits. Skipped {num_splits_skipped} potential splits.")
         final_text = " ".join(output_lines).strip()
-        return re.sub(r'\s{2,}', ' ', final_text)
+        final_text = re.sub(r'\s{2,}', ' ', final_text)
+        final_text = re.sub(r'\s+([.,;?!:])', r'\1', final_text)
+        return final_text
     except Exception as e:
         logging.error(f"Error during sentence splitting application: {e}", exc_info=True)
         return text_with_placeholders # Fallback
