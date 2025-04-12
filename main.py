@@ -224,6 +224,7 @@ def has_subject_and_verb(doc_span: spacy.tokens.Span) -> bool:
         logging.debug(f"      DEBUG S/V Check: Span='{span_text}', HasSubj={span_has_subj}, HasVerb={span_has_verb}")
     return span_has_verb and span_has_subj
 
+
 def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.tokens.Token, Tuple[spacy.tokens.Token, Dict]]]:
     """
     Finds the first valid token where a sentence can be split based on prioritized rules.
@@ -987,11 +988,6 @@ else:
 # ==============================================================================
 # 12. FLASK API ENDPOINT
 # ==============================================================================
-
-@app.route("/clear-cache")
-def clear_cache():
-    cache.clear()
-    return "Cache cleared!"
 
 @app.route('/', methods=['POST'])
 def index():
