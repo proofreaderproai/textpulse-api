@@ -41,7 +41,6 @@ import re
 import traceback # For detailed error logging
 from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional, Tuple, Union
-from flask_caching import Cache
 
 # Flask related imports
 from flask import Flask, request, jsonify
@@ -219,16 +218,16 @@ def has_subject_and_verb(doc_span: spacy.tokens.Span) -> bool:
             for child in token.children:
                 if child.dep_ in ("nsubj", "nsubjpass") and child.i >= doc_span.start and child.i < doc_span.end: span_has_subj = True; break
             if span_has_subj: break
+    # Debugging print (conditional)
     if DEBUG_SPLITTING:
         span_text = doc_span.text[:75] + ('...' if len(doc_span.text) > 75 else '')
-        logging.debug(f"      DEBUG S/V Check: Span='{span_text}', HasSubj={span_has_subj}, HasVerb={span_has_verb}")
+        logging.debug(f"    DEBUG S/V Check: Span='{span_text}', HasSubj={span_has_subj}, HasVerb={span_has_verb}")
     return span_has_verb and span_has_subj
 
 def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.tokens.Token, Tuple[spacy.tokens.Token, Dict]]]:
     """
     Finds the first valid token where a sentence can be split based on prioritized rules.
-    Includes targeted checks within Rule 2.1 (SCONJ context), Rule 2.2 (CCONJ context),
-    and Rule 2.5 (Comma list context).
+    Includes targeted checks within Rule 2.1 (SCONJ) and Rule 2.2 (CCONJ).
     """
     global DEBUG_SPLITTING
 
@@ -237,15 +236,10 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
     sent_len = len(sentence_doc)
     if DEBUG_SPLITTING: logging.debug(f"\nDEBUG Split Check: '{sentence_doc.text[:100]}...'")
 
-    # Word sets/POS tags for specific rule checks
     interrogative_explanatory_sconjs = {'how', 'if', 'whether', 'why', 'when', 'where'}
     preventing_prev_pos_for_target_sconj = {'VERB', 'SCONJ', 'ADP', 'PREP'}
-    list_pattern_pos = {'NUM', 'NOUN', 'PROPN'} # For Rule 2.5 check
-    noun_like_pos = {'NOUN', 'PROPN'} # For Rule 2.2b check
-    noun_gerund_like_pos = {'NOUN', 'PROPN', 'VERB'} # For Rule 2.2b check
 
     # --- Pass 1: Prioritize Semicolon ---
-    # (Semicolon logic remains the same)
     if DEBUG_SPLITTING: logging.debug(f"--- Splitting Pass 1: Checking for Semicolon ---")
     for i, token in enumerate(sentence_doc):
         if token.text == ';':
@@ -263,7 +257,6 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
         if PLACEHOLDER_PATTERN.fullmatch(token.text): continue
         if i == 0 or i >= sent_len - 1: continue
 
-        # Pre-calculate token properties
         is_cc = (token.dep_ == "cc" and token.pos_ == "CCONJ")
         is_mid_sconj = (token.pos_ == 'SCONJ' or token.dep_ == 'mark') and i > 0
         is_comma = (token.text == ',')
@@ -272,18 +265,20 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
         # Rule 2.1: Mid-Sentence SCONJ
         if is_mid_sconj:
-             # (Keep the refined Rule 2.1 logic from the previous version)
-             cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
+             cl1_span = sentence_doc[0 : i]
+             cl2_span = sentence_doc[i + 1 : sent_len]
              if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
                  is_target_sconj = token.lower_ in interrogative_explanatory_sconjs
                  if is_target_sconj and i > 0:
                      prev_token = sentence_doc[i-1]
                      prev_pos = prev_token.pos_
-                     #logging.info(f"TARGETED SCONJ CHECK for '{token.text}' (idx {i}): Preceded by '{prev_token.text}' (pos='{prev_pos}')") # Optional log
+                     #logging.info(f"TARGETED SCONJ CHECK for '{token.text}' (idx {i}): Preceded by '{prev_token.text}' (pos='{prev_pos}')")
                      if prev_pos in preventing_prev_pos_for_target_sconj:
                          #logging.info(f"--> Scenario 1 or 2 DETECTED: Skipping split at target SCONJ '{token.text}' because preceded by {prev_pos}.")
-                         continue # Skip split
-                     #else: logging.info(f"--> Preceding token '{prev_token.text}' ({prev_pos}) OK for target SCONJ '{token.text}'.") # Optional log
+                         continue
+                     else:
+                         pass
+                          #logging.info(f"--> Preceding token '{prev_token.text}' ({prev_pos}) OK, allowing potential split at target SCONJ '{token.text}'.")
                  #logging.info(f"--> Returning SCONJ '{token.text}' (idx {i}) as split point (passed S+V and context checks).")
                  return token
 
@@ -293,60 +288,56 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
             # Context Check 2a: Adj-Adj-Noun (e.g., "red, white, and blue")
             if i > 0 and i < sent_len - 2:
-                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1]; t_after_after_cc = sentence_doc[i+2] # Use distinct names
-                if t_before_cc.pos_ == 'ADJ' and t_after_cc.pos_ == 'ADJ' and t_after_after_cc.pos_ in ('NOUN', 'PROPN') and \
-                   t_before_cc.head.i == t_after_after_cc.i and t_after_cc.head.i == t_after_after_cc.i:
+                t_before = sentence_doc[i-1]; t_after = sentence_doc[i+1]; t_after_after = sentence_doc[i+2]
+                if t_before.pos_ == 'ADJ' and t_after.pos_ == 'ADJ' and t_after_after.pos_ in ('NOUN', 'PROPN') and \
+                   t_before.head.i == t_after_after.i and t_after.head.i == t_after_after.i:
                     should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2a): Adj-Adj-Noun") if DEBUG_SPLITTING else None
 
-            # Context Check 2b: Noun/Gerund Coordination (e.g., "research and outlining")
+            # *** NEW Context Check 2b: Noun/Gerund Coordination ***
+            # Checks for patterns like "noun/propn + 'and' + noun/propn/verb(gerund)" where the second is a conjunct of the first.
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1] # Use distinct names
+                t_before = sentence_doc[i-1]
+                t_after = sentence_doc[i+1]
+                noun_like_pos = {'NOUN', 'PROPN'}
+                noun_gerund_like_pos = {'NOUN', 'PROPN', 'VERB'} # spaCy tags gerunds as VERB
                 try:
-                    if (t_before_cc.pos_ in noun_like_pos and
-                        t_after_cc.pos_ in noun_gerund_like_pos and
-                        t_after_cc.dep_ == 'conj' and t_after_cc.head.i == t_before_cc.i):
+                    # Check POS tags and dependency relation 'conj'
+                    if (t_before.pos_ in noun_like_pos and
+                        t_after.pos_ in noun_gerund_like_pos and
+                        t_after.dep_ == 'conj' and
+                        t_after.head.i == t_before.i):
                          should_prevent_split_cc = True
-                         #logging.info(f"--> CC Prevent Heuristic (2b): Likely Noun/Gerund coordination ('{t_before_cc.text} and {t_after_cc.text}'). Skipping split at '{token.text}'.")
-                except AttributeError: logging.warning(f"Attribute error during CC context check 2b near index {i}")
+                         #logging.info(f"--> CC Prevent Heuristic (2b): Likely Noun/Gerund coordination ('{t_before.text} and {t_after.text}'). Skipping split at '{token.text}'.")
+                except AttributeError:
+                    # Handle cases where attributes might be missing (less likely for standard tokens)
+                    logging.warning(f"Attribute error during CC context check 2b near index {i}")
 
-            # Context Check 2c: Noun/Pronoun-Noun/Pronoun (same non-verb head)
+
+            # Context Check 2c (Old 2b): Noun/Pronoun-Noun/Pronoun (same head - broader check)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1] # Use distinct names
-                if t_before_cc.pos_ in ('NOUN', 'PROPN', 'PRON') and t_after_cc.pos_ in ('NOUN', 'PROPN', 'PRON') and \
-                   t_before_cc.head.i == t_after_cc.head.i:
-                   if t_before_cc.head.pos_ not in ('VERB', 'AUX'):
+                t_before = sentence_doc[i-1]; t_after = sentence_doc[i+1]
+                if t_before.pos_ in ('NOUN', 'PROPN', 'PRON') and t_after.pos_ in ('NOUN', 'PROPN', 'PRON') and \
+                   t_before.head.i == t_after.head.i:
+                   # Added check: only prevent if head is NOT a verb (avoid interfering with clause coordination)
+                   if t_before.head.pos_ not in ('VERB', 'AUX'):
                        should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2c): Noun/Pronoun-Noun/Pronoun same non-verb head") if DEBUG_SPLITTING else None
 
-            # Context Check 2d: Verb/Aux-Verb/Aux (shared subject/head)
+
+            # Context Check 2d (Old 2c): Verb/Aux-Verb/Aux (shared subject/head)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                 t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1] # Use distinct names
-                 if t_before_cc.pos_ in ('VERB', 'AUX') and t_after_cc.pos_ in ('VERB', 'AUX'):
-                     subj_before = {c.i for c in t_before_cc.children if c.dep_ in ('nsubj', 'nsubjpass')}
-                     subj_after = {c.i for c in t_after_cc.children if c.dep_ in ('nsubj', 'nsubjpass')}
+                 t_before = sentence_doc[i-1]; t_after = sentence_doc[i+1]
+                 if t_before.pos_ in ('VERB', 'AUX') and t_after.pos_ in ('VERB', 'AUX'):
+                     subj_before = {c.i for c in t_before.children if c.dep_ in ('nsubj', 'nsubjpass')}
+                     subj_after = {c.i for c in t_after.children if c.dep_ in ('nsubj', 'nsubjpass')}
                      verbs_share_subject = bool(subj_before and subj_before == subj_after)
-                     verbs_share_head = (t_before_cc.head.i == t_after_cc.i or t_after_cc.head.i == t_before_cc.i or t_before_cc.head.i == t_after_cc.head.i or \
-                                         t_before_cc.dep_ == 'aux' and t_before_cc.head.i == t_after_cc.i or t_after_cc.dep_ == 'aux' and t_after_cc.head.i == t_before_cc.i)
+                     # Check if they share a head OR if one is auxiliary modifier of other etc.
+                     verbs_share_head = (t_before.head.i == t_after.i or
+                                         t_after.head.i == t_before.i or
+                                         t_before.head.i == t_after.head.i or
+                                         t_before.dep_ == 'aux' and t_before.head.i == t_after.i or
+                                         t_after.dep_ == 'aux' and t_after.head.i == t_before.i)
                      if verbs_share_subject or verbs_share_head:
                          should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2d): Verb/Aux-Verb/Aux (Shared Subj or Head/Aux)") if DEBUG_SPLITTING else None
-
-            # *** NEW Context Check 2e: List Coordination with Comma before CCONJ ***
-            # Checks for patterns like "..., item1, and item2 ..." or "..., num1, and num2 ..."
-            if not should_prevent_split_cc and i > 1 and i < sent_len - 1: # Need item before comma, comma, CCONJ, item after
-                t_comma = sentence_doc[i-1]       # Token before 'and' (should be comma)
-                t_before_comma = sentence_doc[i-2] # Item before comma
-                t_after_conj = sentence_doc[i+1]   # Item after 'and'
-
-                # Check if token before 'and' is a comma
-                if t_comma.text == ',':
-                    # list_pattern_pos defined earlier: {'NUM', 'NOUN', 'PROPN'}
-                    # Check if items around ", and" are likely list items (NUM/NOUN/PROPN)
-                    if (t_before_comma.pos_ in list_pattern_pos and
-                        t_after_conj.pos_ in list_pattern_pos):
-                         # Optional stricter check: POS tags must match
-                         # if t_before_comma.pos_ == t_after_conj.pos_:
-                         should_prevent_split_cc = True
-                         logging.info(f"--> CC Prevent Heuristic (2e): Likely list coordination with preceding comma ('{t_before_comma.text}, {token.text} {t_after_conj.text}'). Skipping split.")
-
 
             # Fallback S/V Check for CC if no context rule prevented it
             if not should_prevent_split_cc:
@@ -355,12 +346,12 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at CC '{token.text}' (Index {i}) based on S/V check.")
                     return token
                 elif DEBUG_SPLITTING: logging.debug(f"    DEBUG CC Fallback S/V check FAILED for '{token.text}' (Index {i}).")
-            elif DEBUG_SPLITTING: logging.debug(f"  DEBUG: Skipping CCONJ '{token.text}' (Index {i}) due to context rule (2a, 2b, 2c, 2d, or 2e).")
+            elif DEBUG_SPLITTING: logging.debug(f"  DEBUG: Skipping CCONJ '{token.text}' (Index {i}) due to context rule (2a, 2b, 2c, or 2d).")
 
 
         # Rule 2.3: Comma + Conjunctive Adverb
         elif is_comma and i < sent_len - 1:
-            # ... (Existing Rule 2.3 logic) ...
+             # ... (Existing Rule 2.3 logic - unchanged) ...
             t_after_idx = i + 1
             while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
             if t_after_idx >= sent_len : continue
@@ -374,7 +365,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
         # Rule 2.4: Comma + Relative 'which'
         elif is_comma and i < sent_len - 1:
-            # ... (Existing Rule 2.4 logic) ...
+            # ... (Existing Rule 2.4 logic - unchanged) ...
             t_after_idx = i + 1
             while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
             if t_after_idx >= sent_len : continue
@@ -398,7 +389,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
         # Rule 2.5: Potential Comma Splice
         elif is_comma:
-            # ... (Existing check for prior handling) ...
+             # ... (Existing Rule 2.5 logic - unchanged) ...
             is_handled_by_prior_rule = False
             if i < sent_len - 1:
                 t_after_idx = i + 1
@@ -407,54 +398,16 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                     t_after = sentence_doc[t_after_idx]
                     if t_after.lower_ in conjunctive_adverbs and t_after.pos_ == 'ADV': is_handled_by_prior_rule = True
                     if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('nsubj','nsubjpass', 'dobj'): is_handled_by_prior_rule = True
-
             if not is_handled_by_prior_rule:
-                cl1_span_comma = sentence_doc[0 : i]
-                cl2_span_comma = sentence_doc[i + 1 : sent_len]
-                # Check basic S+V condition first
+                cl1_span_comma = sentence_doc[0 : i]; cl2_span_comma = sentence_doc[i + 1 : sent_len]
                 if cl1_span_comma and cl2_span_comma and has_subject_and_verb(cl1_span_comma) and has_subject_and_verb(cl2_span_comma):
-
-                    # *** Context check for lists before allowing comma splice ***
-                    skip_comma_splice = False
-                    if i > 0 and i < sent_len - 2: # Need context around the comma and potential 'and'/'or'
-                        t_before = sentence_doc[i-1]      # Item before comma
-                        t_after_comma = sentence_doc[i+1] # Token immediately after comma
-                        t_after_conj = sentence_doc[i+2]  # Token after that
-
-                        # Log POS tags found for debugging this check
-                        # logging.info(f"RULE 2.5 LIST CHECK: Context for comma at index {i}: "
-                        #             f"Before='{t_before.text}'(POS={t_before.pos_}), "
-                        #             f"AfterComma='{t_after_comma.text}'(POS={t_after_comma.pos_}), "
-                        #             f"AfterConj='{t_after_conj.text}'(POS={t_after_conj.pos_})")
-
-                        # Check for pattern: NUM/NOUN/PROPN + COMMA + CCONJ + NUM/NOUN/PROPN
-                        if (t_after_comma.pos_ == 'CCONJ' and             # Is the token after comma 'and'/'or'?
-                            t_before.pos_ in list_pattern_pos and      # Is token before comma a NUM/NOUN/PROPN?
-                            t_after_conj.pos_ in list_pattern_pos):     # Is token after CCONJ a NUM/NOUN/PROPN?
-                             skip_comma_splice = True
-                             # Log that the pattern matched and split is prevented
-                             logging.info(f"--> Comma Splice Prevented (Rule 2.5): Likely list pattern detected.")
-                        # else:
-                             # Log that the pattern did NOT match
-                             # logging.info(f"--> Comma Splice NOT Prevented (Rule 2.5): List pattern check failed.")
-                    # else:
-                         # Log if context wasn't available (comma too near start/end)
-                         # logging.info(f"--> Comma Splice List Check (Rule 2.5): Not enough context around comma at index {i}.")
-                    # *** END NEW CHECK ***
-
-                    # Proceed only if the list check did NOT set the skip flag
-                    if not skip_comma_splice:
-                        if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Rule 2.5) - Splitting at ',' (Index {i}). Reason: Potential Comma Splice (S/V + S/V).")
-                        # logging.info(f"--> Returning COMMA token at index {i} as split point (Rule 2.5 - passed S+V & list check).") # Optional log
-                        return token # Return the comma as the split point
-                    else:
-                        logging.info(f"--> Skipping split at comma index {i} (Rule 2.5) due to list pattern detection.")
-                        continue # Continue to next token in the main loop
+                    if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ',' (Index {i}). Reason: Potential Comma Splice (S/V + S/V).")
+                    return token
 
 
         # Rule 2.6: Dashes
         elif is_dash:
-             # ... (Existing Rule 2.6 logic) ...
+            # ... (Existing Rule 2.6 logic - unchanged) ...
              is_compound_word_hyphen = False
              if i > 0 and i < sent_len - 1:
                  prev_token, next_token = sentence_doc[i-1], sentence_doc[i+1]
@@ -468,9 +421,10 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                      if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at dash '{token.text}' (Index {i}) based on S/V check.")
                      return token
 
+
         # Rule 2.7: Colons
         elif is_colon :
-             # ... (Existing Rule 2.7 logic) ...
+            # ... (Existing Rule 2.7 logic - unchanged) ...
              cl1_span_colon = sentence_doc[0:i]; cl2_span_colon = sentence_doc[i+1:sent_len]
              if cl2_span_colon and has_subject_and_verb(cl2_span_colon):
                  if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ':' (Index {i}) based on S/V check in second clause.")
@@ -478,7 +432,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
 
     # --- Rule 2.8: Initial SCONJ + Comma ---
-    # ... (Existing Rule 2.8 logic) ...
+    # ... (Existing Rule 2.8 logic - unchanged) ...
     first_real_token_idx = 0
     while first_real_token_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[first_real_token_idx].text): first_real_token_idx += 1
     if first_real_token_idx < sent_len and (sentence_doc[first_real_token_idx].pos_ == 'SCONJ' or sentence_doc[first_real_token_idx].dep_ == 'mark'):
@@ -509,6 +463,9 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
     if DEBUG_SPLITTING and sent_len > 10:
         logging.debug(f"DEBUG: No valid split point found for sentence: '{sentence_doc.text[:100]}...'")
     return None
+
+
+
 
 
 
@@ -987,11 +944,6 @@ else:
 # ==============================================================================
 # 12. FLASK API ENDPOINT
 # ==============================================================================
-
-@app.route("/clear-cache")
-def clear_cache():
-    cache.clear()
-    return "Cache cleared!"
 
 @app.route('/', methods=['POST'])
 def index():
