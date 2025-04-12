@@ -41,14 +41,14 @@ import re
 import traceback # For detailed error logging
 from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional, Tuple, Union
-from flask_caching import Cache
+from flask_caching import Cache # Note: Cache is imported but not used in the provided snippet. Remove if unused.
 
 # Flask related imports
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 # *** Assuming python-dotenv is needed if you use .env file ***
 # *** If you set env vars via systemd or other means, you can remove dotenv ***
-#from dotenv import load_dotenv # To load .env file
+# from dotenv import load_dotenv # To load .env file
 
 # NLP/ML related imports
 try:
@@ -60,14 +60,14 @@ try:
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, set_seed
 except ImportError as e:
     print(f"FATAL Error: Missing required library: {e}. Please install requirements.")
-    print("Try: pip install Flask python-dotenv flask-cors spacy torch transformers openai textstat") # Added flask-cors and python-dotenv here
+    print("Try: pip install Flask flask-cors spacy torch transformers openai textstat python-dotenv") # Added flask-cors and python-dotenv here
     # Exit if core dependencies are missing
     sys.exit(1)
 
 # ==============================================================================
-# Load .env file (immediately after imports)
+# Load .env file (immediately after imports) - Uncomment if needed
 # ==============================================================================
-#load_dotenv() # Loads variables from .env into environment
+# load_dotenv() # Loads variables from .env into environment
 
 # ==============================================================================
 # 2. CONFIGURATION & CONSTANTS
@@ -122,8 +122,6 @@ openai_api_key = os.environ.get("OPENAI_API_KEY")
 
 openai_client = None
 logging.info("Attempting to initialize OpenAI client...")
-# Use the actual key variable here (either hardcoded or from env)
-# openai_api_key = openai_api_key # This line is redundant, removed
 
 if not openai_api_key or not openai_api_key.startswith("sk-"):
     logging.warning("OPENAI_API_KEY environment variable not found, invalid, or key format incorrect.")
@@ -132,6 +130,7 @@ else:
     try:
         openai_client = openai.OpenAI(api_key=openai_api_key)
         # Optional: Test connection (add timeout)
+        # You might want to remove this test call in production to avoid unnecessary API calls on startup.
         # openai_client.with_options(timeout=10.0).models.list()
         logging.info("OpenAI client initialized successfully using environment variable.")
     except Exception as e:
@@ -155,7 +154,8 @@ def calculate_burstiness(text: str) -> float:
     if mean == 0: return 0.0
     variance = sum([(f - mean) ** 2 for f in freqs]) / num_freqs
     std_dev = variance ** 0.5
-    return std_dev / mean
+    # Avoid division by zero if std_dev is 0 (text is uniform)
+    return (std_dev / mean) if mean > 0 else 0.0
 
 def calculate_modification_percentage(text1: str, text2: str) -> float:
     """Calculates the percentage of modification between two texts."""
@@ -174,6 +174,8 @@ def calculate_ttr(text: str) -> float:
     unique_types = len(set(words))
     return unique_types / total_tokens
 
+# >>> START OF PART 2 <<<
+
 # ==============================================================================
 # 5. HELPER FUNCTIONS: PARAPHRASING
 # ==============================================================================
@@ -190,9 +192,18 @@ def paraphrase_sentence(
         input_ids = tokenizer.encode(
             input_text, return_tensors="pt", max_length=max_length, truncation=True
         ).to(model.device)
+
         if input_ids.shape[1] == 0:
             logging.error(f"Encoding resulted in empty tensor for sentence: '{sentence_with_placeholders[:50]}...'")
             return "[Encoding Error]"
+
+        # Check if input_ids exceed max_length *after* encoding (shouldn't happen with truncation=True, but safety check)
+        if input_ids.shape[1] > max_length:
+             logging.warning(f"Input sentence encoding length ({input_ids.shape[1]}) exceeded max_length ({max_length}) even after truncation. Output might be poor. Sentence: '{sentence_with_placeholders[:50]}...'")
+             # Optionally truncate again, though tokenizer should handle this
+             input_ids = input_ids[:, :max_length]
+
+
         outputs = model.generate(
             input_ids=input_ids, num_beams=num_beams, max_length=max_length, early_stopping=True,
             no_repeat_ngram_size=no_repeat_ngram_size, repetition_penalty=repetition_penalty
@@ -204,7 +215,7 @@ def paraphrase_sentence(
         return f"[Paraphrasing Error: {e}]"
 
 # ==============================================================================
-# 6. HELPER FUNCTIONS: SENTENCE SPLITTING
+# 6. HELPER FUNCTIONS: SENTENCE SPLITTING (Part 1 - Dependency Checks)
 # ==============================================================================
 def has_subject_and_verb(doc_span: spacy.tokens.Span) -> bool:
     """Checks if a spaCy span likely contains an explicit subject and a main verb."""
@@ -213,15 +224,20 @@ def has_subject_and_verb(doc_span: spacy.tokens.Span) -> bool:
     for token in doc_span:
         if token.pos_ in ("VERB", "AUX"): span_has_verb = True; verb_indices_in_span.add(token.i)
     if not span_has_verb: return False
+    # Check for nominal subjects attached to verbs within the span
     for token in doc_span:
         if token.dep_ in ("nsubj", "nsubjpass") and token.head.i in verb_indices_in_span: span_has_subj = True; break
+        # Check if a root verb in the span has a nominal subject within the span
         elif token.dep_ == "ROOT" and token.pos_ in ("VERB", "AUX") and token.i in verb_indices_in_span:
             for child in token.children:
-                if child.dep_ in ("nsubj", "nsubjpass") and child.i >= doc_span.start and child.i < doc_span.end: span_has_subj = True; break
-            if span_has_subj: break
+                # Ensure child is within the span's boundaries
+                if child.dep_ in ("nsubj", "nsubjpass") and child.i >= doc_span.start and child.i < doc_span.end:
+                    span_has_subj = True; break
+            if span_has_subj: break # Found subject for this root verb
+
     if DEBUG_SPLITTING:
         span_text = doc_span.text[:75] + ('...' if len(doc_span.text) > 75 else '')
-        logging.debug(f"      DEBUG S/V Check: Span='{span_text}', HasSubj={span_has_subj}, HasVerb={span_has_verb}")
+        logging.debug(f"       DEBUG S/V Check: Span='{span_text}', HasSubj={span_has_subj}, HasVerb={span_has_verb}")
     return span_has_verb and span_has_subj
 
 
@@ -231,88 +247,89 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
     Includes targeted checks within Rule 2.1 (SCONJ context), Rule 2.2 (CCONJ context),
     and Rule 2.5 (Comma list context).
     """
-    global DEBUG_SPLITTING
+    global DEBUG_SPLITTING # Ensure DEBUG_SPLITTING flag is accessible
 
     conjunctive_adverbs = {'however', 'therefore', 'moreover', 'consequently', 'thus', 'furthermore', 'nevertheless', 'instead', 'otherwise', 'accordingly', 'subsequently', 'hence'}
-    dash_chars = {'-', '—', '–'}
+    dash_chars = {'-', '—', '–'} # Using em dash and en dash as well
     sent_len = len(sentence_doc)
     if DEBUG_SPLITTING: logging.debug(f"\nDEBUG Split Check: '{sentence_doc.text[:100]}...'")
 
     # Word sets/POS tags for specific rule checks
     interrogative_explanatory_sconjs = {'how', 'if', 'whether', 'why', 'when', 'where'}
-    preventing_prev_pos_for_target_sconj = {'VERB', 'SCONJ', 'ADP', 'PREP'}
-    list_pattern_pos = {'NUM', 'NOUN', 'PROPN'} # For Rule 2.5 check
-    noun_like_pos = {'NOUN', 'PROPN'} # For Rule 2.2b check
-    noun_gerund_like_pos = {'NOUN', 'PROPN', 'VERB'} # For Rule 2.2b check
+    preventing_prev_pos_for_target_sconj = {'VERB', 'SCONJ', 'ADP', 'PREP'} # Note: PREP might be too restrictive, test
+    list_pattern_pos = {'NUM', 'NOUN', 'PROPN', 'ADJ'} # Added ADJ for lists like "red, white, and blue"
+    noun_like_pos = {'NOUN', 'PROPN', 'PRON'} # Added PRON
+    noun_gerund_like_pos = {'NOUN', 'PROPN', 'VERB', 'PRON'} # Added PRON
 
     # --- Pass 1: Prioritize Semicolon ---
-    # (Semicolon logic remains the same)
     if DEBUG_SPLITTING: logging.debug(f"--- Splitting Pass 1: Checking for Semicolon ---")
     for i, token in enumerate(sentence_doc):
         if token.text == ';':
-             if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' at index {i}. Checking S/V around it.")
-             cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
-             if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
-                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Priority) - Splitting at ';' (Index {i}) based on S/V check.")
-                 return token
-             else:
-                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' (Index {i}) but FAILED S/V check around it. Ignoring this semicolon.")
+            if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' at index {i}. Checking S/V around it.")
+            # Check only non-empty spans
+            cl1_span = sentence_doc[0 : i] if i > 0 else None
+            cl2_span = sentence_doc[i + 1 : sent_len] if i + 1 < sent_len else None
+            if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
+                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Priority) - Splitting at ';' (Index {i}) based on S/V check.")
+                return token
+            else:
+                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: Found ';' (Index {i}) but FAILED S/V check around it or resulted in empty clause. Ignoring this semicolon.")
 
     # --- Pass 2: Check Other Rules ---
     if DEBUG_SPLITTING: logging.debug(f"--- Splitting Pass 2: Checking Other Rules ---")
     for i, token in enumerate(sentence_doc):
+        # Skip placeholders and tokens too close to the edge
         if PLACEHOLDER_PATTERN.fullmatch(token.text): continue
         if i == 0 or i >= sent_len - 1: continue
 
         # Pre-calculate token properties
         is_cc = (token.dep_ == "cc" and token.pos_ == "CCONJ")
-        is_mid_sconj = (token.pos_ == 'SCONJ' or token.dep_ == 'mark') and i > 0
+        is_mid_sconj = (token.pos_ == 'SCONJ' or token.dep_ == 'mark') # Removed i > 0 check, handled by loop range
         is_comma = (token.text == ',')
         is_dash = (token.text in dash_chars)
         is_colon = (token.text == ':')
 
         # Rule 2.1: Mid-Sentence SCONJ
         if is_mid_sconj:
-             # (Keep the refined Rule 2.1 logic from the previous version)
-             cl1_span = sentence_doc[0 : i]; cl2_span = sentence_doc[i + 1 : sent_len]
-             if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
-                 is_target_sconj = token.lower_ in interrogative_explanatory_sconjs
-                 if is_target_sconj and i > 0:
-                     prev_token = sentence_doc[i-1]
-                     prev_pos = prev_token.pos_
-                     #logging.info(f"TARGETED SCONJ CHECK for '{token.text}' (idx {i}): Preceded by '{prev_token.text}' (pos='{prev_pos}')") # Optional log
-                     if prev_pos in preventing_prev_pos_for_target_sconj:
-                         #logging.info(f"--> Scenario 1 or 2 DETECTED: Skipping split at target SCONJ '{token.text}' because preceded by {prev_pos}.")
-                         continue # Skip split
-                     #else: logging.info(f"--> Preceding token '{prev_token.text}' ({prev_pos}) OK for target SCONJ '{token.text}'.") # Optional log
-                 #logging.info(f"--> Returning SCONJ '{token.text}' (idx {i}) as split point (passed S+V and context checks).")
-                 return token
+            cl1_span = sentence_doc[0 : i] # Always valid as i > 0
+            cl2_span = sentence_doc[i + 1 : sent_len] # Always valid as i < sent_len - 1
+            if cl1_span and cl2_span and has_subject_and_verb(cl1_span) and has_subject_and_verb(cl2_span):
+                is_target_sconj = token.lower_ in interrogative_explanatory_sconjs
+                if is_target_sconj: # No need for i > 0 check here again
+                    prev_token = sentence_doc[i-1]
+                    prev_pos = prev_token.pos_
+                    if DEBUG_SPLITTING: logging.debug(f"    DEBUG SCONJ Check: Target SCONJ '{token.text}' preceded by '{prev_token.text}' (POS='{prev_pos}')")
+                    if prev_pos in preventing_prev_pos_for_target_sconj:
+                        if DEBUG_SPLITTING: logging.debug(f"    DEBUG SCONJ Prevent: Scenario DETECTED. Skipping split.")
+                        continue # Skip split for this SCONJ
+                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at SCONJ '{token.text}' (Index {i}) based on S/V and context.")
+                return token # Return the SCONJ token as the split point
 
         # Rule 2.2: CCONJ (e.g., and, but, or) with Context Checks
         elif is_cc:
             should_prevent_split_cc = False
 
             # Context Check 2a: Adj-Adj-Noun (e.g., "red, white, and blue")
-            if i > 0 and i < sent_len - 2:
-                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1]; t_after_after_cc = sentence_doc[i+2] # Use distinct names
+            if i > 0 and i < sent_len - 2: # Check boundaries: Need token before, after, and after-after
+                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1]; t_after_after_cc = sentence_doc[i+2]
                 if t_before_cc.pos_ == 'ADJ' and t_after_cc.pos_ == 'ADJ' and t_after_after_cc.pos_ in ('NOUN', 'PROPN') and \
                    t_before_cc.head.i == t_after_after_cc.i and t_after_cc.head.i == t_after_after_cc.i:
                     should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2a): Adj-Adj-Noun") if DEBUG_SPLITTING else None
 
-            # Context Check 2b: Noun/Gerund Coordination (e.g., "research and outlining")
+            # Context Check 2b: Noun/Gerund/Pronoun Coordination (e.g., "research and outlining", "he and I")
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1] # Use distinct names
+                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1]
                 try:
                     if (t_before_cc.pos_ in noun_like_pos and
                         t_after_cc.pos_ in noun_gerund_like_pos and
                         t_after_cc.dep_ == 'conj' and t_after_cc.head.i == t_before_cc.i):
-                         should_prevent_split_cc = True
-                         #logging.info(f"--> CC Prevent Heuristic (2b): Likely Noun/Gerund coordination ('{t_before_cc.text} and {t_after_cc.text}'). Skipping split at '{token.text}'.")
+                        should_prevent_split_cc = True
+                        logging.debug(f"    DEBUG CC Prevent (2b): Likely Noun/Gerund/Pronoun coord ('{t_before_cc.text} {token.text} {t_after_cc.text}')") if DEBUG_SPLITTING else None
                 except AttributeError: logging.warning(f"Attribute error during CC context check 2b near index {i}")
 
             # Context Check 2c: Noun/Pronoun-Noun/Pronoun (same non-verb head)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1] # Use distinct names
+                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1]
                 if t_before_cc.pos_ in ('NOUN', 'PROPN', 'PRON') and t_after_cc.pos_ in ('NOUN', 'PROPN', 'PRON') and \
                    t_before_cc.head.i == t_after_cc.head.i:
                    if t_before_cc.head.pos_ not in ('VERB', 'AUX'):
@@ -320,33 +337,37 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
             # Context Check 2d: Verb/Aux-Verb/Aux (shared subject/head)
             if not should_prevent_split_cc and i > 0 and i < sent_len - 1:
-                 t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1] # Use distinct names
-                 if t_before_cc.pos_ in ('VERB', 'AUX') and t_after_cc.pos_ in ('VERB', 'AUX'):
-                     subj_before = {c.i for c in t_before_cc.children if c.dep_ in ('nsubj', 'nsubjpass')}
-                     subj_after = {c.i for c in t_after_cc.children if c.dep_ in ('nsubj', 'nsubjpass')}
-                     verbs_share_subject = bool(subj_before and subj_before == subj_after)
-                     verbs_share_head = (t_before_cc.head.i == t_after_cc.i or t_after_cc.head.i == t_before_cc.i or t_before_cc.head.i == t_after_cc.head.i or \
-                                         t_before_cc.dep_ == 'aux' and t_before_cc.head.i == t_after_cc.i or t_after_cc.dep_ == 'aux' and t_after_cc.head.i == t_before_cc.i)
-                     if verbs_share_subject or verbs_share_head:
-                         should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2d): Verb/Aux-Verb/Aux (Shared Subj or Head/Aux)") if DEBUG_SPLITTING else None
+                t_before_cc = sentence_doc[i-1]; t_after_cc = sentence_doc[i+1]
+                if t_before_cc.pos_ in ('VERB', 'AUX') and t_after_cc.pos_ in ('VERB', 'AUX'):
+                    # Check if they share the same subject (nsubj points to the same token index)
+                    subj_before = {c.i for c in t_before_cc.children if c.dep_ in ('nsubj', 'nsubjpass')}
+                    subj_after = {c.i for c in t_after_cc.children if c.dep_ in ('nsubj', 'nsubjpass')}
+                    verbs_share_subject = bool(subj_before and subj_before == subj_after)
 
-            # *** NEW Context Check 2e: List Coordination with Comma before CCONJ ***
-            # Checks for patterns like "..., item1, and item2 ..." or "..., num1, and num2 ..."
-            if not should_prevent_split_cc and i > 1 and i < sent_len - 1: # Need item before comma, comma, CCONJ, item after
-                t_comma = sentence_doc[i-1]       # Token before 'and' (should be comma)
+                    # Check if they share the same head OR if one is aux of the other
+                    verbs_share_head = (t_before_cc.head.i == t_after_cc.head.i or \
+                                        t_before_cc.head.i == t_after_cc.i or \
+                                        t_after_cc.head.i == t_before_cc.i or \
+                                        (t_before_cc.dep_ == 'aux' and t_before_cc.head.i == t_after_cc.i) or \
+                                        (t_after_cc.dep_ == 'aux' and t_after_cc.head.i == t_before_cc.i))
+
+                    if verbs_share_subject or verbs_share_head:
+                        should_prevent_split_cc = True; logging.debug(f"    DEBUG CC Prevent (2d): Verb/Aux-Verb/Aux (Shared Subj or Head/Aux)") if DEBUG_SPLITTING else None
+
+            # Context Check 2e: List Coordination with Comma before CCONJ (Oxford Comma or just list item)
+            if not should_prevent_split_cc and i > 1 and i < sent_len - 1: # Need token before comma, comma, CCONJ, token after
+                t_comma = sentence_doc[i-1]        # Token before CCONJ (should be comma)
                 t_before_comma = sentence_doc[i-2] # Item before comma
-                t_after_conj = sentence_doc[i+1]   # Item after 'and'
+                t_after_conj = sentence_doc[i+1]   # Item after CCONJ
 
-                # Check if token before 'and' is a comma
                 if t_comma.text == ',':
-                    # list_pattern_pos defined earlier: {'NUM', 'NOUN', 'PROPN'}
-                    # Check if items around ", and" are likely list items (NUM/NOUN/PROPN)
+                    # Check if items around ", CCONJ" are likely list items (using list_pattern_pos)
                     if (t_before_comma.pos_ in list_pattern_pos and
                         t_after_conj.pos_ in list_pattern_pos):
-                         # Optional stricter check: POS tags must match
-                         # if t_before_comma.pos_ == t_after_conj.pos_:
-                         should_prevent_split_cc = True
-                         logging.info(f"--> CC Prevent Heuristic (2e): Likely list coordination with preceding comma ('{t_before_comma.text}, {token.text} {t_after_conj.text}'). Skipping split.")
+                        # Optional stricter check: POS tags must match (e.g., NOUN, CCONJ NOUN or ADJ, CCONJ ADJ)
+                        # if t_before_comma.pos_ == t_after_conj.pos_:
+                        should_prevent_split_cc = True
+                        logging.debug(f"    DEBUG CC Prevent (2e): Likely list coord with comma ('{t_before_comma.text}, {token.text} {t_after_conj.text}')") if DEBUG_SPLITTING else None
 
 
             # Fallback S/V Check for CC if no context rule prevented it
@@ -361,45 +382,57 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
         # Rule 2.3: Comma + Conjunctive Adverb
         elif is_comma and i < sent_len - 1:
-            # ... (Existing Rule 2.3 logic) ...
             t_after_idx = i + 1
+            # Skip over any placeholders immediately after the comma
             while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
-            if t_after_idx >= sent_len : continue
+            if t_after_idx >= sent_len : continue # Reached end while skipping placeholders
+
             t_after = sentence_doc[t_after_idx]
             if t_after.lower_ in conjunctive_adverbs and t_after.pos_ == 'ADV':
-                cl1_span_conj = sentence_doc[0 : i]; cl2_span_start_idx = t_after_idx + 1
+                cl1_span_conj = sentence_doc[0 : i] # Clause before comma
+                cl2_span_start_idx = t_after_idx + 1 # Clause starts AFTER the conjunctive adverb
                 cl2_span_conj = sentence_doc[cl2_span_start_idx : sent_len] if cl2_span_start_idx < sent_len else None
+                # Check S/V in both clauses
                 if cl1_span_conj and cl2_span_conj and has_subject_and_verb(cl1_span_conj) and has_subject_and_verb(cl2_span_conj):
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ',' (Index {i}) based on Conj. Adverb '{t_after.text}'.")
-                    return token
+                    return token # Return the comma as split point
 
-        # Rule 2.4: Comma + Relative 'which'
+        # Rule 2.4: Comma + Relative 'which' (Non-restrictive clause)
         elif is_comma and i < sent_len - 1:
-            # ... (Existing Rule 2.4 logic) ...
             t_after_idx = i + 1
+            # Skip over any placeholders immediately after the comma
             while t_after_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[t_after_idx].text): t_after_idx += 1
-            if t_after_idx >= sent_len : continue
+            if t_after_idx >= sent_len : continue # Reached end while skipping placeholders
+
             t_after = sentence_doc[t_after_idx]
-            if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('nsubj', 'nsubjpass', 'dobj'):
-                cl1_span_which = sentence_doc[0 : i]; cl2_check_start_idx = t_after_idx + 1
+            # Check for 'which' used as a relative pronoun (WDT) introducing a clause (common dependencies)
+            if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('relcl', 'nsubj', 'nsubjpass', 'dobj', 'pobj', 'acomp', 'advcl'): # Added more potential deps for clauses
+                cl1_span_which = sentence_doc[0 : i] # Clause before comma
+                cl2_check_start_idx = t_after_idx + 1 # Clause check starts AFTER 'which'
                 cl2_check_span = sentence_doc[cl2_check_start_idx : sent_len] if cl2_check_start_idx < sent_len else None
+                # Check S/V in first clause AND that the 'which' clause contains a verb
                 if cl1_span_which and cl2_check_span and has_subject_and_verb(cl1_span_which) and \
                    any(t.pos_ in ("VERB", "AUX") for t in cl2_check_span if not PLACEHOLDER_PATTERN.fullmatch(t.text)):
-                    antecedent = t_after.head ; pronoun = "It"
+
+                    # Determine pronoun replacement based on 'which' antecedent's number
+                    antecedent = t_after.head ; pronoun = "It" # Default to 'It'
                     try:
                         morph_num = antecedent.morph.get('Number')
                         if morph_num and 'Plur' in morph_num: pronoun = "They"
+                        # Heuristic for nouns ending in 's' that are likely plural
                         elif antecedent.pos_ == 'NOUN' and antecedent.text.lower().endswith('s') and not morph_num:
                              singular_form = antecedent.lemma_
                              if singular_form != antecedent.text.lower(): pronoun = "They"
-                    except Exception: pass
+                    except Exception as morph_err: logging.warning(f"Morph analysis failed for antecedent '{antecedent.text}': {morph_err}")
+
                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ',' (Index {i}) based on Relative Clause 'which'. Antecedent='{antecedent.text}', Pronoun='{pronoun}'.")
+                    # Return the comma and details for replacement
                     return (token, {'type': 'relative_which', 'pronoun': pronoun, 'replace_token': t_after})
 
 
-        # Rule 2.5: Potential Comma Splice
+        # Rule 2.5: Potential Comma Splice (Independent Clause + Comma + Independent Clause)
         elif is_comma:
-            # ... (Existing check for prior handling) ...
+            # Check if this comma was already handled by Rule 2.3 (Conj Adverb) or 2.4 (Relative Which)
             is_handled_by_prior_rule = False
             if i < sent_len - 1:
                 t_after_idx = i + 1
@@ -407,254 +440,300 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                 if t_after_idx < sent_len:
                     t_after = sentence_doc[t_after_idx]
                     if t_after.lower_ in conjunctive_adverbs and t_after.pos_ == 'ADV': is_handled_by_prior_rule = True
-                    if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('nsubj','nsubjpass', 'dobj'): is_handled_by_prior_rule = True
+                    if t_after.lower_ == 'which' and t_after.tag_ == 'WDT' and t_after.dep_ in ('relcl','nsubj','nsubjpass', 'dobj','pobj','acomp','advcl'): is_handled_by_prior_rule = True
 
             if not is_handled_by_prior_rule:
                 cl1_span_comma = sentence_doc[0 : i]
                 cl2_span_comma = sentence_doc[i + 1 : sent_len]
-                # Check basic S+V condition first
+                # Check basic S+V condition first for both clauses
                 if cl1_span_comma and cl2_span_comma and has_subject_and_verb(cl1_span_comma) and has_subject_and_verb(cl2_span_comma):
 
-                    # *** Context check for lists before allowing comma splice ***
+                    # Context check for lists to prevent splitting lists like "..., item1, and item2" at the comma
                     skip_comma_splice = False
-                    if i > 0 and i < sent_len - 2: # Need context around the comma and potential 'and'/'or'
-                        t_before = sentence_doc[i-1]      # Item before comma
+                    # Check for pattern: ITEM + COMMA + CCONJ + ITEM
+                    if i > 0 and i < sent_len - 2: # Need context: item before, comma, CCONJ, item after
+                        t_before = sentence_doc[i-1]        # Item before comma
                         t_after_comma = sentence_doc[i+1] # Token immediately after comma
-                        t_after_conj = sentence_doc[i+2]  # Token after that
+                        t_after_conj = sentence_doc[i+2]    # Token after that
 
-                        # Log POS tags found for debugging this check
-                        # logging.info(f"RULE 2.5 LIST CHECK: Context for comma at index {i}: "
-                        #             f"Before='{t_before.text}'(POS={t_before.pos_}), "
-                        #             f"AfterComma='{t_after_comma.text}'(POS={t_after_comma.pos_}), "
-                        #             f"AfterConj='{t_after_conj.text}'(POS={t_after_conj.pos_})")
-
-                        # Check for pattern: NUM/NOUN/PROPN + COMMA + CCONJ + NUM/NOUN/PROPN
-                        if (t_after_comma.pos_ == 'CCONJ' and             # Is the token after comma 'and'/'or'?
-                            t_before.pos_ in list_pattern_pos and      # Is token before comma a NUM/NOUN/PROPN?
-                            t_after_conj.pos_ in list_pattern_pos):     # Is token after CCONJ a NUM/NOUN/PROPN?
-                             skip_comma_splice = True
-                             # Log that the pattern matched and split is prevented
-                             logging.info(f"--> Comma Splice Prevented (Rule 2.5): Likely list pattern detected.")
-                        # else:
-                             # Log that the pattern did NOT match
-                             # logging.info(f"--> Comma Splice NOT Prevented (Rule 2.5): List pattern check failed.")
-                    # else:
-                         # Log if context wasn't available (comma too near start/end)
-                         # logging.info(f"--> Comma Splice List Check (Rule 2.5): Not enough context around comma at index {i}.")
-                    # *** END NEW CHECK ***
+                        # Check if token after comma is a coordinating conjunction
+                        if t_after_comma.pos_ == 'CCONJ':
+                            # Check if items around "COMMA CCONJ" are likely list items
+                            if (t_before.pos_ in list_pattern_pos and
+                                t_after_conj.pos_ in list_pattern_pos):
+                                skip_comma_splice = True
+                                logging.debug(f"    DEBUG Comma Splice Prevent (2.5 List): Likely list pattern around '{t_before.text}, {t_after_comma.text} {t_after_conj.text}'") if DEBUG_SPLITTING else None
 
                     # Proceed only if the list check did NOT set the skip flag
                     if not skip_comma_splice:
                         if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Rule 2.5) - Splitting at ',' (Index {i}). Reason: Potential Comma Splice (S/V + S/V).")
-                        # logging.info(f"--> Returning COMMA token at index {i} as split point (Rule 2.5 - passed S+V & list check).") # Optional log
                         return token # Return the comma as the split point
                     else:
-                        logging.info(f"--> Skipping split at comma index {i} (Rule 2.5) due to list pattern detection.")
+                        # Skipped due to list pattern detection
                         continue # Continue to next token in the main loop
 
 
-        # Rule 2.6: Dashes
+        # Rule 2.6: Dashes (em dash, en dash, hyphen) likely separating clauses
         elif is_dash:
-             # ... (Existing Rule 2.6 logic) ...
-             is_compound_word_hyphen = False
-             if i > 0 and i < sent_len - 1:
-                 prev_token, next_token = sentence_doc[i-1], sentence_doc[i+1]
-                 if prev_token.idx + len(prev_token.text) == token.idx and \
-                    token.idx + len(token.text) == next_token.idx and \
-                    prev_token.is_alpha and next_token.is_alpha:
-                     is_compound_word_hyphen = True
-             if not is_compound_word_hyphen:
-                 cl1_span_dash = sentence_doc[0 : i]; cl2_span_dash = sentence_doc[i + 1 : sent_len]
-                 if cl1_span_dash and cl2_span_dash and has_subject_and_verb(cl1_span_dash) and has_subject_and_verb(cl2_span_dash):
-                     if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at dash '{token.text}' (Index {i}) based on S/V check.")
-                     return token
+            # Heuristic: Check if it's likely a hyphen connecting parts of a word (no spaces around)
+            is_compound_word_hyphen = False
+            if token.text == '-' and i > 0 and i < sent_len - 1:
+                prev_token, next_token = sentence_doc[i-1], sentence_doc[i+1]
+                # Check if tokens are alphabetic and there are no spaces around the hyphen
+                if prev_token.is_alpha and next_token.is_alpha and \
+                   prev_token.idx + len(prev_token.text) == token.idx and \
+                   token.idx + len(token.text) == next_token.idx:
+                    is_compound_word_hyphen = True
+                    if DEBUG_SPLITTING: logging.debug(f"    DEBUG Dash Skip: Likely compound word hyphen: '{prev_token.text}{token.text}{next_token.text}'")
 
-        # Rule 2.7: Colons
+            if not is_compound_word_hyphen:
+                cl1_span_dash = sentence_doc[0 : i]; cl2_span_dash = sentence_doc[i + 1 : sent_len]
+                # Check S/V on both sides
+                if cl1_span_dash and cl2_span_dash and has_subject_and_verb(cl1_span_dash) and has_subject_and_verb(cl2_span_dash):
+                    if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at dash '{token.text}' (Index {i}) based on S/V check.")
+                    return token # Return dash token
+
+        # Rule 2.7: Colons introducing an independent clause
         elif is_colon :
-             # ... (Existing Rule 2.7 logic) ...
-             cl1_span_colon = sentence_doc[0:i]; cl2_span_colon = sentence_doc[i+1:sent_len]
-             if cl2_span_colon and has_subject_and_verb(cl2_span_colon):
-                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ':' (Index {i}) based on S/V check in second clause.")
-                 return token
+            cl1_span_colon = sentence_doc[0:i]; cl2_span_colon = sentence_doc[i+1:sent_len]
+            # Check if the part *after* the colon forms an independent clause (has S/V)
+            if cl1_span_colon and cl2_span_colon and has_subject_and_verb(cl2_span_colon):
+                if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ':' (Index {i}) based on S/V check in second clause.")
+                return token # Return colon token
 
 
-    # --- Rule 2.8: Initial SCONJ + Comma ---
-    # ... (Existing Rule 2.8 logic) ...
+    # --- Rule 2.8 (Check after Pass 2): Initial SCONJ + Comma separating clauses ---
     first_real_token_idx = 0
+    # Skip initial placeholders
     while first_real_token_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[first_real_token_idx].text): first_real_token_idx += 1
+
+    # Check if the first *actual* token is a subordinating conjunction or marker
     if first_real_token_idx < sent_len and (sentence_doc[first_real_token_idx].pos_ == 'SCONJ' or sentence_doc[first_real_token_idx].dep_ == 'mark'):
         initial_sconj_token = sentence_doc[first_real_token_idx]
         if DEBUG_SPLITTING: logging.debug(f"--- Splitting Rule 2.8: Checking for Initial SCONJ '{initial_sconj_token.text}' + Comma ---")
+
         comma_found = False
-        for i_rule28, token_rule28 in enumerate(sentence_doc): # Use different loop variables
+        for i_rule28, token_rule28 in enumerate(sentence_doc):
+            # Start search *after* the initial SCONJ
             if token_rule28.i <= first_real_token_idx: continue
             if PLACEHOLDER_PATTERN.fullmatch(token_rule28.text): continue
+
+            # Found a potential separating comma
             if token_rule28.text == ',':
                 comma_found = True
+                # Clause 1 is between SCONJ and Comma
                 cl1_check_span_rule28 = sentence_doc[first_real_token_idx + 1 : i_rule28]
+                # Clause 2 is after Comma
                 cl2_span_rule28 = sentence_doc[i_rule28 + 1 : sent_len]
-                if cl1_check_span_rule28 and cl2_span_rule28 and has_subject_and_verb(cl1_check_span_rule28) and has_subject_and_verb(cl2_span_rule28):
+
+                # Check S/V in both potential main clauses (after SCONJ, after comma)
+                if cl1_check_span_rule28 and cl2_span_rule28 and \
+                   has_subject_and_verb(cl1_check_span_rule28) and \
+                   has_subject_and_verb(cl2_span_rule28):
+
+                    # Avoid splitting if the comma is introducing a relative 'which' clause (handled by Rule 2.4)
                     is_which_case = False
                     next_real_token_idx = i_rule28 + 1
                     while next_real_token_idx < sent_len and PLACEHOLDER_PATTERN.fullmatch(sentence_doc[next_real_token_idx].text): next_real_token_idx += 1
                     if next_real_token_idx < sent_len:
                         next_real_token = sentence_doc[next_real_token_idx]
                         if next_real_token.lower_=='which' and next_real_token.tag_=='WDT': is_which_case=True
+
                     if not is_which_case:
                         if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Rule 2.8) - Splitting at ',' (Index {i_rule28}) following initial SCONJ '{initial_sconj_token.text}'.")
-                        return token_rule28
-                break
+                        return token_rule28 # Return the comma
+
+                break # Found the first comma after the SCONJ, decision made based on S/V
 
 
     # --- No split point found by any rule ---
-    if DEBUG_SPLITTING and sent_len > 10:
+    if DEBUG_SPLITTING and sent_len > 10: # Only log if sentence is reasonably long
         logging.debug(f"DEBUG: No valid split point found for sentence: '{sentence_doc.text[:100]}...'")
     return None
 
+# >>> START OF PART 3 <<<
 
+# ==============================================================================
+# 6. HELPER FUNCTIONS: SENTENCE SPLITTING (Part 2 - Application Logic)
+# ==============================================================================
 
-# *** Start of Modified apply_sentence_splitting Function ***
 def apply_sentence_splitting(text_with_placeholders: str, nlp_model: spacy.Language) -> str:
     """
     Applies sentence splitting logic using find_split_token.
     Includes checks to prevent splits if:
-    - The second clause starts with a dependent marker (how, why, if, etc.).
-    - Either resulting clause is too short (MIN_SPLIT_WORDS).
+    - The second clause starts with a common dependent marker.
+    - Either resulting clause is too short (MIN_SPLIT_WORDS, excluding placeholders).
     """
-    # Ensure DEBUG_SPLITTING is accessible, or pass it as an argument if needed
-    global DEBUG_SPLITTING # Make sure it's accessible or remove if passed
+    global DEBUG_SPLITTING # Make sure it's accessible
 
     if not text_with_placeholders or not text_with_placeholders.strip(): return ""
 
-    # *** Define Minimum Word Count - SET THIS APPROPRIATELY (e.g., 6 or 7) ***
-    MIN_SPLIT_WORDS = 7 # Using 7 for safety, adjust as needed
+    # Minimum number of *actual words* (not placeholders) required in each resulting clause
+    MIN_SPLIT_WORDS = 7 # Adjust as needed based on testing
 
-    # *** Define common words that start dependent clauses ***
-    # Using lowercase and requiring a following space for better matching
+    # Common words/phrases (lowercase, with trailing space) that often start dependent clauses
+    # Making this more specific to avoid overly aggressive prevention
     dependent_clause_starters = {
         'how ', 'why ', 'if ', 'whether ', 'when ', 'where ', 'because ',
         'although ', 'though ', 'while ', 'since ', 'unless ', 'until ',
-        'as ', 'after ', 'before ', 'so that ', 'such that ', 'whenever ',
-        'wherever ', 'whereas '
-        # Note: 'that' can be ambiguous, omitted for now. Add if needed.
+        'after ', 'before ', 'so that ', 'such that ', 'whenever ',
+        'wherever ', 'whereas ', 'even if ', 'even though ', 'as if ', 'as though '
+        # Omitting 'as ' and 'that ' as they are too ambiguous
     }
 
-
-    # *** ADDED LOGGING: Log input to this function ***
-    logging.info(f"APPLY_SENTENCE_SPLITTING INPUT (first 500 chars): >>>{text_with_placeholders[:500]}<<<")
-
     logging.info("Applying sentence splitting rules...")
-    output_lines = []; num_splits = 0; num_splits_skipped = 0 # Track skipped splits
+    output_lines = []; num_splits = 0; num_splits_skipped_length = 0; num_splits_skipped_dependent = 0
     try:
+        # Process the text with placeholders using the provided spaCy model
         doc = nlp_model(text_with_placeholders)
-        for sent_idx, sent in enumerate(doc.sents): # Added index for logging
+        for sent_idx, sent in enumerate(doc.sents):
             original_sentence_text = sent.text
-            if not original_sentence_text.strip(): continue
+            if not original_sentence_text or not original_sentence_text.strip(): continue
 
             if DEBUG_SPLITTING: logging.debug(f"\nProcessing Sent #{sent_idx}: '{original_sentence_text[:100]}...'")
 
+            # Preserve original punctuation for the second clause if split occurs
             original_ends_with_question = original_sentence_text.strip().endswith('?')
             original_ends_with_exclamation = original_sentence_text.strip().endswith('!')
             default_ending = "?" if original_ends_with_question else "!" if original_ends_with_exclamation else "."
 
-            split_token_result = find_split_token(sent) # Use the find_split_token with dependency/heuristic checks
+            # Find a potential split point using the detailed rules
+            split_token_result = find_split_token(sent)
             split_details, split_token = None, None
             if isinstance(split_token_result, tuple): split_token, split_details = split_token_result
             elif split_token_result is not None: split_token = split_token_result
 
             if split_token is not None:
-                # --- Potential Split Found - Extract Clauses First ---
-                # (Clause extraction logic remains the same as previous versions)
-                split_idx_in_sent = split_token.i - sent.start
-                clause1_start_char_idx = sent.start_char; clause1_end_char_idx = split_token.idx
+                # --- Potential Split Found - Extract Clauses ---
+                split_idx_in_sent = split_token.i - sent.start # Index of split token within the sentence span
+
+                # Determine Clause 1 Text
+                clause1_start_char_idx = sent.start_char
+                clause1_end_char_idx = split_token.idx # End *before* the split token
+
+                # Handle case: Initial SCONJ ("Because X, Y" -> split at comma -> "X")
                 first_real_token_idx_sent = 0
                 while first_real_token_idx_sent < len(sent) and PLACEHOLDER_PATTERN.fullmatch(sent[first_real_token_idx_sent].text): first_real_token_idx_sent += 1
                 if first_real_token_idx_sent < len(sent) and \
                    (sent[first_real_token_idx_sent].pos_ == 'SCONJ' or sent[first_real_token_idx_sent].dep_ == 'mark') and \
                    split_token.text == ',':
-                    if first_real_token_idx_sent + 1 < len(sent): clause1_start_char_idx = sent[first_real_token_idx_sent + 1].idx
-                    else: clause1_start_char_idx = split_token.idx
+                   if first_real_token_idx_sent + 1 < len(sent):
+                       # Start Clause 1 *after* the initial SCONJ
+                       clause1_start_char_idx = sent[first_real_token_idx_sent + 1].idx
+                   else: # Should not happen if comma exists, but safety check
+                       clause1_start_char_idx = split_token.idx
+
+                # Handle case: Split at SCONJ/CCONJ preceeded by comma ("..., and X" -> split at 'and' -> "...")
                 if split_token.pos_ != 'PUNCT' and split_idx_in_sent > 0:
                     preceding_token = sent[split_idx_in_sent - 1]
-                    if preceding_token.text == ',': clause1_end_char_idx = preceding_token.idx
-                clause1_raw_text = doc.text[clause1_start_char_idx:clause1_end_char_idx]
+                    if preceding_token.text == ',':
+                        clause1_end_char_idx = preceding_token.idx # End clause 1 before the comma
 
-                clause2_start_char_idx = split_token.idx + len(split_token.text); clause2_end_char_idx = sent.end_char; clause2_prefix = ""
+                clause1_raw_text = doc.text[clause1_start_char_idx : clause1_end_char_idx]
+
+                # Determine Clause 2 Text
+                clause2_start_char_idx = split_token.idx + len(split_token.text) # Start *after* the split token
+                clause2_end_char_idx = sent.end_char
+                clause2_prefix = ""
+
+                # Handle case: Relative 'which' replacement
                 if split_details and split_details.get('type') == 'relative_which':
                     replace_token = split_details['replace_token']
+                    # Start clause 2 *after* the 'which' token that gets replaced
                     clause2_start_char_idx = replace_token.idx + len(replace_token.text)
-                    clause2_prefix = split_details['pronoun']
+                    clause2_prefix = split_details['pronoun'] # Add pronoun prefix (e.g., "It", "They")
+
+                # Handle case: Comma followed by Conjunctive Adverb ("..., however X" -> split at comma -> "However X")
+                # (Need to check token after split_token)
                 elif split_token.text == ',' and (split_token.i + 1) < sent.end:
                     next_token_idx = split_token.i + 1
+                    # Skip placeholders after comma
                     while next_token_idx < sent.end and PLACEHOLDER_PATTERN.fullmatch(sent.doc[next_token_idx].text): next_token_idx+=1
                     if next_token_idx < sent.end:
-                         next_token = sent.doc[next_token_idx]
-                         conjunctive_adverbs_local = {'however', 'therefore', 'moreover', 'consequently', 'thus', 'furthermore', 'nevertheless', 'instead', 'otherwise', 'accordingly', 'subsequently', 'hence'}
-                         if next_token.lower_ in conjunctive_adverbs_local and next_token.pos_ == 'ADV':
-                             clause2_start_char_idx = next_token.idx + len(next_token.text)
-                clause2_base = doc.text[clause2_start_char_idx:clause2_end_char_idx]
+                        next_token = sent.doc[next_token_idx]
+                        conjunctive_adverbs_local = {'however', 'therefore', 'moreover', 'consequently', 'thus', 'furthermore', 'nevertheless', 'instead', 'otherwise', 'accordingly', 'subsequently', 'hence'}
+                        if next_token.lower_ in conjunctive_adverbs_local and next_token.pos_ == 'ADV':
+                            # Start clause 2 *after* the conjunctive adverb
+                            clause2_start_char_idx = next_token.idx + len(next_token.text)
 
+                clause2_base = doc.text[clause2_start_char_idx : clause2_end_char_idx]
+
+                # --- Clean and Check Clauses ---
                 clause1_cleaned = clause1_raw_text.strip().strip('.,;:')
                 clause2_base_cleaned = clause2_base.strip().strip('.,;:')
                 clause2_cleaned = f"{clause2_prefix} {clause2_base_cleaned}".strip() if clause2_prefix else clause2_base_cleaned
 
-                # --- Calculate Word Counts (excluding placeholders) ---
+                # Calculate Word Counts (excluding placeholders)
                 clause1_word_count = len([word for word in clause1_cleaned.split() if not PLACEHOLDER_PATTERN.fullmatch(word)])
                 clause2_word_count = len([word for word in clause2_cleaned.split() if not PLACEHOLDER_PATTERN.fullmatch(word)])
 
-                # *** ADDED LOGGING: Log values before decision ***
-                logging.info(f"SPLIT CHECK (Sent #{sent_idx}): Token='{split_token.text}' @ index {split_token.i}, "
-                             f"C1 words={clause1_word_count} ('{clause1_cleaned[:30]}...'), "
-                             f"C2 words={clause2_word_count} ('{clause2_cleaned[:30]}...'), "
-                             f"MIN_SPLIT={MIN_SPLIT_WORDS}")
+                if DEBUG_SPLITTING:
+                    logging.debug(f"    DEBUG Split Check (Sent #{sent_idx}): Token='{split_token.text}' @ idx {split_token.i}, "
+                                   f"C1 words={clause1_word_count} ('{clause1_cleaned[:30]}...'), "
+                                   f"C2 words={clause2_word_count} ('{clause2_cleaned[:30]}...'), "
+                                   f"MIN_SPLIT={MIN_SPLIT_WORDS}")
 
-                # --- Check if Clause 2 starts with a dependent marker ---
+                # Check if Clause 2 starts with a dependent marker
                 starts_with_dependent = False
-                clause2_lower = clause2_cleaned.lower() # Check lowercase
+                clause2_lower = clause2_cleaned.lower()
                 for starter in dependent_clause_starters:
                     if clause2_lower.startswith(starter):
                         starts_with_dependent = True
-                        break # Found one, no need to check others
+                        break
 
                 # --- Decision Logic ---
                 if not clause1_cleaned or not clause2_cleaned:
-                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Skipping (Empty Clause)")
-                    output_lines.append(original_sentence_text)
-                    num_splits_skipped += 1
-                elif starts_with_dependent: # <<< CHECK ADDED HERE
-                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Skipping (Clause 2 starts with dependent marker: '{clause2_cleaned[:30]}...')")
-                    output_lines.append(original_sentence_text)
-                    num_splits_skipped += 1
+                    if DEBUG_SPLITTING: logging.debug(f"    -> SPLIT DECISION (Sent #{sent_idx}): Skipping (Empty Clause)")
+                    output_lines.append(original_sentence_text) # Keep original
+                    # num_splits_skipped_empty += 1 # Optional: track reason
+                elif starts_with_dependent:
+                    if DEBUG_SPLITTING: logging.debug(f"    -> SPLIT DECISION (Sent #{sent_idx}): Skipping (Clause 2 starts with dependent marker: '{clause2_cleaned[:30]}...')")
+                    output_lines.append(original_sentence_text) # Keep original
+                    num_splits_skipped_dependent += 1
                 elif clause1_word_count < MIN_SPLIT_WORDS or clause2_word_count < MIN_SPLIT_WORDS:
-                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Skipping (Too Short: {clause1_word_count} < {MIN_SPLIT_WORDS} or {clause2_word_count} < {MIN_SPLIT_WORDS})")
-                    output_lines.append(original_sentence_text)
-                    num_splits_skipped += 1
+                    if DEBUG_SPLITTING: logging.debug(f"    -> SPLIT DECISION (Sent #{sent_idx}): Skipping (Too Short: C1={clause1_word_count}, C2={clause2_word_count} < MIN={MIN_SPLIT_WORDS})")
+                    output_lines.append(original_sentence_text) # Keep original
+                    num_splits_skipped_length += 1
                 else:
-                    #logging.info(f"-> SPLIT DECISION (Sent #{sent_idx}): Proceeding with Split")
+                    # Proceed with Split
+                    if DEBUG_SPLITTING: logging.debug(f"    -> SPLIT DECISION (Sent #{sent_idx}): Proceeding with Split.")
                     num_splits += 1
-                    # Capitalization and Appending Logic...
+
+                    # Capitalization helper
                     def capitalize_first_letter(s: str) -> str:
-                       match = re.search(r'([a-zA-Z])', s);
-                       if match: start_index = match.start(); return s[:start_index] + s[start_index].upper() + s[start_index+1:]
-                       return s
-                    clause1_capitalized = capitalize_first_letter(clause1_cleaned)
-                    clause2_capitalized = capitalize_first_letter(clause2_cleaned)
-                    if clause1_capitalized: output_lines.append(clause1_capitalized.rstrip('.?!') + ".")
-                    if clause2_capitalized: output_lines.append(clause2_capitalized.rstrip('.?!') + default_ending)
+                        match = re.search(r'([a-zA-Z])', s); # Find first alphabetical character
+                        if match:
+                            start_index = match.start();
+                            return s[:start_index] + s[start_index].upper() + s[start_index+1:]
+                        return s # Return original if no letter found
+
+                    clause1_final = capitalize_first_letter(clause1_cleaned).rstrip('.?!') + "." # End first clause with period
+                    clause2_final = capitalize_first_letter(clause2_cleaned).rstrip('.?!') + default_ending # Use original ending for second
+
+                    # Append clauses only if they are not empty after cleaning
+                    if clause1_final.strip('.'): output_lines.append(clause1_final)
+                    if clause2_final.strip(default_ending): output_lines.append(clause2_final)
 
             else: # No split point found by find_split_token
                 if DEBUG_SPLITTING: logging.debug(f"No split point found for Sent #{sent_idx}.")
-                output_lines.append(original_sentence_text)
+                output_lines.append(original_sentence_text) # Keep original sentence
 
-        logging.info(f"Sentence splitting applied. Performed {num_splits} splits. Skipped {num_splits_skipped} potential splits.")
+
+        logging.info(f"Sentence splitting applied. Performed {num_splits} splits. Skipped: {num_splits_skipped_length} (length), {num_splits_skipped_dependent} (dependent marker).")
+
+        # Join sentences back, clean up spacing around punctuation
         final_text = " ".join(output_lines).strip()
-        final_text = re.sub(r'\s{2,}', ' ', final_text)
-        final_text = re.sub(r'\s+([.,;?!:])', r'\1', final_text)
+        final_text = re.sub(r'\s{2,}', ' ', final_text) # Condense multiple spaces
+        final_text = re.sub(r'\s+([.,;?!:])', r'\1', final_text) # Remove space before punctuation
+        # Ensure space after punctuation where needed (e.g., ".Next" -> ". Next") - handles most cases
+        final_text = re.sub(r'([.,;?!:])([^\s\d__])', r'\1 \2', final_text) # Add space after punct if followed by non-space, non-digit, non-placeholder
+
         return final_text
+
     except Exception as e:
         logging.error(f"Error during sentence splitting application: {e}", exc_info=True)
-        return text_with_placeholders # Fallback
-# *** End of Modified apply_sentence_splitting Function ***
+        return text_with_placeholders # Fallback to text before splitting on error
+
 
 # ==============================================================================
 # 7. HELPER FUNCTIONS: OPENAI REFINEMENT
@@ -664,90 +743,150 @@ def refine_with_openai(text_with_placeholders: str, discipline: str) -> str:
     if not openai_client:
         logging.warning("OpenAI client not available. Skipping refinement step.")
         return text_with_placeholders
+
+    # Basic check if text is reasonably processable
+    if not text_with_placeholders or not text_with_placeholders.strip():
+         logging.warning("Input text to OpenAI refinement is empty. Skipping.")
+         return text_with_placeholders
+
     logging.info("Applying OpenAI refinement (around placeholders)...")
     start_time = time.time()
-    system_prompt = "You are a punctuation and spelling repair-bot. Your output will be displayed in a structured web app interface. Do not include any explanations or commentary—only return the modified text."
+
+    # Define prompts (Consider making discipline influence the prompt more if needed)
+    system_prompt = "You are an expert academic editor specializing in refining texts while preserving specific formatting like placeholders (e.g., __F0__). Your task is to subtly improve fluency, grammar, and style based on the user's rules, outputting only the modified text without explanations."
+
     user_prompt_parts = [
-        "Repair the following text based on these rules:", "--- TEXT START ---", text_with_placeholders, "--- TEXT END ---", "--- RULES ---",
-        "- Ignored freeze terms (e.g., __F0__) and leave them untouched.",
-        "- For approximately 50% of the passive voice sentences in the text, change them to the active voice.",
-        "- In approximately 50% of sentences, replace common modal verbs (e.g., can, could, may, might, should, would) with more natural or conversational alternatives.",
-        "- In approximately 50% of sentences, replace infinitive verb forms (e.g., 'to analyze') with gerunds (e.g., 'analyzing').",
-        "- Strictly remove the Oxford comma in lists of three or more items.",
-        "- The input text contains sentences separated by periods (.), question marks (?), etc. DO NOT merge these sentences. Apply all other rules ONLY *within* the boundaries of each existing sentence. Treat them as separate entities which cannot be merged. Never replace a period with a comma.",
-        "- Review the beginning of each sentence. If a sentence starts *exactly* with 'And ', 'But ', 'Or ', or 'So ', remove that initial word and the following space.",
-        "- Correct only critical spelling or punctuation errors within the current sentence."
+        "Carefully refine the following text according to the rules provided. Preserve the exact placeholders (like __F0__, __F1__) without modification.",
+        "--- TEXT START ---",
+        text_with_placeholders,
+        "--- TEXT END ---",
+        "--- REFINEMENT RULES ---",
+        # Note: Applying rules probabilistically (e.g., "50%") is hard for the LLM to do accurately and consistently.
+        # Stating the rules directly might be more effective. Consider if these rules are essential or if simpler
+        # grammar/style correction is the main goal.
+        "1. Passive to Active: Where appropriate and natural, convert passive voice sentences to active voice.",
+        "2. Modal Verbs: Replace common modal verbs (can, could, may, might, should, would) with alternatives if it improves naturalness, avoiding overuse.",
+        "3. Infinitives to Gerunds: Convert infinitive verb forms ('to analyze') to gerunds ('analyzing') if it enhances flow, but not excessively.",
+        "4. Oxford Comma: Consistently remove the Oxford comma in lists of three or more items (e.g., 'A, B and C' NOT 'A, B, and C').",
+        "5. Sentence Boundaries: Maintain existing sentence boundaries marked by periods (.), question marks (?), or exclamation points (!). DO NOT merge sentences or replace end punctuation with commas.",
+        "6. Initial Conjunctions: If a sentence starts *exactly* with 'And ', 'But ', 'Or ', or 'So ', remove that initial word and the following space.",
+        "7. Error Correction: Correct obvious, critical spelling or grammatical errors ONLY. Prioritize preserving the original meaning and structure.",
+        f"8. Discipline Context: Maintain a formal, academic tone suitable for the '{discipline}' discipline (unless discipline is 'casual', 'blogger_seo', or 'marketing').",
+        "9. Placeholders: VERY IMPORTANT - Do not change, add, or remove any placeholders like __F0__, __F1__, etc. They must remain exactly as they appear in the input text."
     ]
     user_prompt = "\n".join(user_prompt_parts)
+
     try:
         response = openai_client.chat.completions.create(
-            model=CONFIG["openai_model"], messages=[ {"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt} ],
-            temperature=CONFIG["openai_temperature"], max_tokens=CONFIG["openai_max_tokens"]
+            model=CONFIG["openai_model"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=CONFIG["openai_temperature"],
+            max_tokens=CONFIG["openai_max_tokens"] # Ensure this is large enough for the output
         )
         end_time = time.time()
+
         refined_text = response.choices[0].message.content.strip()
+
+        # Basic validation of the response
+        if not refined_text or len(refined_text) < 0.5 * len(text_with_placeholders): # Check if response is suspiciously short
+             logging.warning("OpenAI response seems invalid (empty or too short). Returning text before refinement.")
+             return text_with_placeholders
+        if "sorry" in refined_text.lower() or "cannot fulfill" in refined_text.lower():
+             logging.warning("OpenAI response indicates refusal. Returning text before refinement.")
+             return text_with_placeholders
+
+        # Placeholder check (Simple version: count should ideally match)
+        original_ph_count = len(PLACEHOLDER_PATTERN.findall(text_with_placeholders))
+        refined_ph_count = len(PLACEHOLDER_PATTERN.findall(refined_text))
+        if original_ph_count > 0 and original_ph_count != refined_ph_count:
+             logging.warning(f"OpenAI Placeholder count mismatch! Original: {original_ph_count}, Refined: {refined_ph_count}. Returning text before refinement to preserve placeholders.")
+             return text_with_placeholders
+
         logging.info(f"OpenAI refinement completed in {end_time - start_time:.2f} seconds.")
-        if not refined_text or "sorry" in refined_text.lower() or "cannot fulfill" in refined_text.lower():
-            logging.warning("OpenAI response invalid or refusal. Returning text before refinement.")
-            return text_with_placeholders
-        if refined_text == text_with_placeholders: logging.info("OpenAI returned identical text.")
-        else: logging.info("OpenAI returned modified text.")
+        if refined_text == text_with_placeholders:
+            logging.info("OpenAI returned identical text.")
+        else:
+            logging.info("OpenAI returned modified text.")
         return refined_text
+
     except Exception as e:
         logging.error(f"Error during OpenAI API call: {e}", exc_info=True)
         return text_with_placeholders # Return original on error
 
 # ==============================================================================
-# 8. MODEL LOADING FUNCTION (Optimized)
+# 8. MODEL LOADING FUNCTION (Optimized - Called once at startup)
 # ==============================================================================
 def load_models(device_preference: str = "auto") -> Optional[Dict[str, Any]]:
     """Loads and initializes NLP models (spaCy, Paraphraser, AI Detector), disabling unused spaCy components."""
     logging.info("--- Loading Models ---")
     models = {}
-    # Determine device
-    if device_preference == "auto": models["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-    elif device_preference == "cuda" and torch.cuda.is_available(): models["device"] = "cuda"
-    else: models["device"] = "cpu"; logging.warning("CUDA requested but not available. Using CPU.") if device_preference == "cuda" else None
-    logging.info(f"Using device: {models['device']}")
+
+    # Determine compute device (CUDA if available, otherwise CPU)
+    try:
+        if device_preference == "auto":
+            models["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif device_preference == "cuda" and torch.cuda.is_available():
+            models["device"] = torch.device("cuda")
+        else:
+            models["device"] = torch.device("cpu")
+            if device_preference == "cuda": # Log warning only if CUDA was explicitly requested but unavailable
+                logging.warning("CUDA requested but not available. Using CPU.")
+        logging.info(f"Using device: {models['device']}")
+    except Exception as device_err:
+        logging.error(f"Error detecting torch device: {device_err}. Defaulting to CPU.")
+        models["device"] = torch.device("cpu")
+
 
     try:
-        # Load spaCy model (disable 'ner' as it's likely unused)
+        # Load spaCy model
         spacy_model_name = CONFIG['spacy_model']
-        logging.info(f"Loading spaCy model: {spacy_model_name} (disabling NER)...")
+        # *** Optimization: Disable unused components like 'ner' ***
+        # Adjust 'disable' list based on actual components needed by your splitting logic (parser, tagger are likely needed)
+        disabled_spacy_components = ['ner']
+        logging.info(f"Loading spaCy model: {spacy_model_name} (disabling: {disabled_spacy_components})...")
         try:
-            # *** Optimization: Disable unused components ***
-            models["nlp"] = spacy.load(spacy_model_name, disable=['ner'])
+            models["nlp"] = spacy.load(spacy_model_name, disable=disabled_spacy_components)
         except OSError:
-            logging.warning(f"spaCy model '{spacy_model_name}' not found. Attempting download...")
+            logging.warning(f"spaCy model '{spacy_model_name}' not found locally. Attempting download...")
             try:
                 spacy.cli.download(spacy_model_name)
-                models["nlp"] = spacy.load(spacy_model_name, disable=['ner'])
+                models["nlp"] = spacy.load(spacy_model_name, disable=disabled_spacy_components)
                 logging.info(f"spaCy model '{spacy_model_name}' downloaded and loaded.")
             except Exception as download_err:
                 logging.error(f"Failed to download/load spaCy model '{spacy_model_name}': {download_err}", exc_info=True)
-                return None
+                return None # Critical failure if spaCy model cannot be loaded
         logging.info("spaCy model loaded.")
 
-        # Load Paraphraser
+        # Load Paraphraser (T5 based)
         paraphraser_model_name = CONFIG['paraphraser_model']
         logging.info(f"Loading paraphraser: {paraphraser_model_name}...")
+        # Load tokenizer first
         models["tokenizer"] = AutoTokenizer.from_pretrained(paraphraser_model_name)
+        # Load model and move to the determined device
         models["model"] = AutoModelForSeq2SeqLM.from_pretrained(paraphraser_model_name).to(models["device"])
+        models["model"].eval() # Set model to evaluation mode
         logging.info("Paraphraser model loaded.")
 
-        # Load AI Detector
+        # Load AI Detector (RoBERTa based)
         ai_detector_model_name = CONFIG['ai_detector_model']
         logging.info(f"Loading AI detector: {ai_detector_model_name}...")
+        # Use device mapping for pipeline (-1 for CPU, 0 for first GPU, etc.)
+        pipeline_device = 0 if models["device"].type == 'cuda' else -1
+        # Temporarily reduce transformers logging during pipeline load if desired
         previous_verbosity = transformers.logging.get_verbosity()
-        transformers.logging.set_verbosity_error() # Suppress warnings
-        models["ai_detector"] = pipeline("text-classification", model=ai_detector_model_name, device=models["device"])
-        transformers.logging.set_verbosity(previous_verbosity)
+        transformers.logging.set_verbosity_error()
+        models["ai_detector"] = pipeline("text-classification", model=ai_detector_model_name, device=pipeline_device)
+        transformers.logging.set_verbosity(previous_verbosity) # Restore verbosity
         logging.info("AI detector pipeline loaded.")
 
         logging.info("--- All models loaded successfully ---")
         return models
+
     except Exception as e:
-        logging.exception("Fatal error during model loading:")
+        logging.exception("Fatal error during model loading:") # Log the full traceback
         return None
 
 # ==============================================================================
@@ -762,10 +901,14 @@ def process_text(
     if not input_text or not input_text.strip():
         logging.error("Input text is empty.")
         return {'status': 'error', 'message': 'Input text cannot be empty.'}
+
+    # Word count check (using simple split)
     word_count = len(input_text.split())
-    if word_count > config["input_max_words"]:
-        logging.error(f"Input text exceeds word limit ({word_count}/{config['input_max_words']}).")
-        return {'status': 'error', 'message': f"Error: Text exceeds word limit ({config['input_max_words']} words). Provided: {word_count}."}
+    max_words = config.get("input_max_words", 1000) # Default to 1000 if not in config
+    if word_count > max_words:
+        logging.error(f"Input text exceeds word limit ({word_count}/{max_words}).")
+        # Consider customizing error message based on plan limits in a real app
+        return {'status': 'error', 'message': f"Error: Text exceeds word limit ({max_words} words). Provided: {word_count}."}
 
     logging.info(f"--- Starting Text Processing for request ---")
     logging.info(f"Discipline: {discipline}, Input Words: {word_count}, Freeze Terms: {len(freeze_terms)}")
@@ -776,172 +919,260 @@ def process_text(
         placeholder_map: Dict[str, str] = {}
         text_with_placeholders = input_text
         placeholder_counter = 0
+        # Filter and sort freeze terms (longest first to avoid partial replacements)
         freeze_terms_sorted = sorted([ft for ft in freeze_terms if ft and ft.strip()], key=len, reverse=True)
+
         if freeze_terms_sorted:
-            logging.info(f"Replacing {len(freeze_terms_sorted)} freeze term(s) with placeholders...")
-            processed_spans_map: Dict[int, Tuple[int, str]] = {}
-            temp_text_for_search = text_with_placeholders
+            logging.info(f"Replacing {len(freeze_terms_sorted)} freeze term type(s) with placeholders...")
+            processed_spans_map: Dict[int, Tuple[int, str]] = {} # Store start -> (end, placeholder)
+
+            # Iterate through sorted terms to find and mark replacements
             for term in freeze_terms_sorted:
-                # *** SyntaxError Fix Applied Below ***
                 term_stripped = term.strip()
-                if not term_stripped:
-                    continue # Skip empty terms after stripping
-                # *** End SyntaxError Fix ***
+                if not term_stripped: continue # Skip empty terms
+
                 try:
-                    pattern = re.compile(re.escape(term_stripped), re.IGNORECASE); matches_this_term = []
-                    for match in pattern.finditer(temp_text_for_search):
+                    # Use word boundaries for more precise matching, case-insensitive
+                    # Note: \b might not work well with punctuation attached. Simple escape might be safer.
+                    # pattern = re.compile(r'\b' + re.escape(term_stripped) + r'\b', re.IGNORECASE)
+                    pattern = re.compile(re.escape(term_stripped), re.IGNORECASE) # Safer default
+                    matches_this_term = []
+                    # Find all non-overlapping matches for *this specific term*
+                    for match in pattern.finditer(text_with_placeholders): # Search in the current state of text_with_placeholders
                         start, end = match.span()
+                        # Check for overlaps with already processed spans
                         is_overlapping = any(max(start, ps) < min(end, pe) for ps, (pe, _) in processed_spans_map.items())
-                        if not is_overlapping: matches_this_term.append(match)
+                        if not is_overlapping:
+                            matches_this_term.append(match)
+
+                    # If matches found, create placeholder and mark spans
                     if matches_this_term:
-                        original_term_matched = matches_this_term[0].group(0)
+                        original_term_matched = matches_this_term[0].group(0) # Use the case from the first match
                         placeholder = f"__F{placeholder_counter}__"
-                        placeholder_map[placeholder] = original_term_matched; placeholder_counter += 1
-                        for match in matches_this_term: processed_spans_map[match.start()] = (match.end(), placeholder)
+                        placeholder_map[placeholder] = original_term_matched
+                        placeholder_counter += 1
+                        # Mark all non-overlapping matches for this term with the *same* placeholder
+                        for match in matches_this_term:
+                            processed_spans_map[match.start()] = (match.end(), placeholder)
+
                 except re.error as regex_err: logging.warning(f"Regex error for freeze term '{term_stripped}': {regex_err}")
                 except Exception as term_err: logging.warning(f"Error processing freeze term '{term_stripped}': {term_err}")
+
+            # Perform replacements using the marked spans (from right to left to avoid index issues)
             if processed_spans_map:
-                sorted_starts = sorted(processed_spans_map.keys(), reverse=True); temp_text_list = list(text_with_placeholders)
-                for start in sorted_starts: end, placeholder = processed_spans_map[start]; temp_text_list[start:end] = list(placeholder)
+                sorted_starts = sorted(processed_spans_map.keys(), reverse=True)
+                temp_text_list = list(text_with_placeholders)
+                for start in sorted_starts:
+                    end, placeholder = processed_spans_map[start]
+                    temp_text_list[start:end] = list(placeholder) # Replace slice with placeholder chars
                 text_with_placeholders = "".join(temp_text_list)
-                logging.info(f"{placeholder_counter} placeholder types created for {len(processed_spans_map)} replacements.")
-        else: logging.info("No freeze terms provided.")
+                logging.info(f"{placeholder_counter} placeholder type(s) created, corresponding to {len(processed_spans_map)} replacements.")
+
+        else:
+            logging.info("No valid freeze terms provided or found.")
+
 
         # --- Paraphrasing Sentences ---
         logging.info("Tokenizing text (with placeholders) into sentences...")
         try:
+            # Use spaCy model loaded earlier
             doc = models["nlp"](text_with_placeholders)
-            sentences = [s.text.strip() for s in doc.sents if s.text.strip()]
-            if not sentences: return {'status': 'error', 'message': 'No valid sentences found after placeholder step.'}
-        except Exception as nlp_err: return {'status': 'error', 'message': f'Sentence tokenization failed: {nlp_err}'}
-        try: # Check original sentence length
-            original_doc = models["nlp"](input_text)
-            original_sentences_map = {i: s.text.strip() for i, s in enumerate(original_doc.sents) if s.text.strip()}
-        except Exception as nlp_err_orig: logging.warning(f"Could not tokenize original text: {nlp_err_orig}"); original_sentences_map = {}
+            # Filter empty sentences after stripping whitespace
+            sentences = [s.text.strip() for s in doc.sents if s.text and s.text.strip()]
+            if not sentences:
+                 logging.error("No valid sentences found after placeholder replacement and tokenization.")
+                 return {'status': 'error', 'message': 'No valid sentences found to process.'}
+        except Exception as nlp_err:
+            logging.error(f"Sentence tokenization failed: {nlp_err}", exc_info=True)
+            return {'status': 'error', 'message': f'Sentence tokenization failed: {nlp_err}'}
 
-        paraphrased_sentences = []; sentences_reverted = 0
+        # Optional: Check length of original sentences before paraphrasing (can be slow)
+        # try:
+        #     original_doc = models["nlp"](input_text)
+        #     original_sentences_map = {i: s.text.strip() for i, s in enumerate(original_doc.sents) if s.text.strip()}
+        # except Exception as nlp_err_orig:
+        #     logging.warning(f"Could not tokenize original text for length check: {nlp_err_orig}"); original_sentences_map = {}
+
+        paraphrased_sentences = []; sentences_reverted = 0; sentences_failed = 0
         logging.info(f"Paraphrasing {len(sentences)} sentences...")
-        for i, sentence_with_placeholder in enumerate(sentences):
-            # Check original length if possible
-            original_sentence_for_check = original_sentences_map.get(i, None)
-            if original_sentence_for_check:
-                 try:
-                      sentence_tokens = models["tokenizer"].tokenize(original_sentence_for_check)
-                      if len(sentence_tokens) > config["input_max_sentence_tokens"]:
-                           msg = f"Error: Original Sentence #{i+1} exceeds token limit ({len(sentence_tokens)}/{config['input_max_sentence_tokens']})."
-                           logging.error(msg)
-                           return { 'status': 'error', 'message': msg }
-                 except Exception as token_err: logging.warning(f"Tokenization failed for length check on sentence {i+1}: {token_err}")
+        max_sentence_tokens = config.get("input_max_sentence_tokens", 480)
 
-            paraphrased = paraphrase_sentence(sentence_with_placeholder, models["model"], models["tokenizer"], config["paraphrase_num_beams"], config["paraphrase_max_length"])
+        for i, sentence_with_placeholder in enumerate(sentences):
+             # Check token length *before* paraphrasing (using the paraphraser tokenizer)
+            try:
+                # Include the "paraphrase: " prefix in length check if applicable to model
+                check_text = f"paraphrase: {sentence_with_placeholder}"
+                sentence_tokens = models["tokenizer"].encode(check_text, max_length=max_sentence_tokens + 10, truncation=False) # Check without truncating initially
+                if len(sentence_tokens) > max_sentence_tokens:
+                    msg = f"Error: Sentence #{i+1} (with placeholders) exceeds token limit for paraphraser ({len(sentence_tokens)}/{max_sentence_tokens}). Skipping paraphrase for this sentence."
+                    logging.warning(msg)
+                    # Option 1: Skip paraphrase, keep original (with placeholders)
+                    paraphrased_sentences.append(sentence_with_placeholder); sentences_reverted += 1
+                    # Option 2: Return error immediately (uncomment below)
+                    # return { 'status': 'error', 'message': msg.replace("Error: ","") }
+                    continue # Move to next sentence
+            except Exception as token_err:
+                logging.warning(f"Tokenization failed for length check on sentence {i+1}: {token_err}")
+                # Decide how to handle - proceed cautiously or skip/error
+
+
+            # Proceed with paraphrasing
+            paraphrased = paraphrase_sentence(
+                sentence_with_placeholder,
+                models["model"], models["tokenizer"],
+                config["paraphrase_num_beams"], config["paraphrase_max_length"]
+            )
+
+            # Check for paraphrasing errors
             if "[Paraphrasing Error:" in paraphrased or "[Encoding Error]" in paraphrased:
                 logging.error(f"Paraphrasing failed for sentence {i+1}: {paraphrased}")
-                return {'status': 'error', 'message': f"Error paraphrasing sentence #{i+1}: {paraphrased}"}
+                # Option 1: Keep original sentence
+                paraphrased_sentences.append(sentence_with_placeholder); sentences_failed += 1
+                # Option 2: Return error immediately (uncomment below)
+                # return {'status': 'error', 'message': f"Error paraphrasing sentence #{i+1}: {paraphrased}"}
+                continue # Move to next sentence
 
-            # Verify placeholder preservation
+            # Verify placeholder preservation (crucial!)
             placeholders_in_original = set(PLACEHOLDER_PATTERN.findall(sentence_with_placeholder))
             if placeholders_in_original:
                 placeholders_in_paraphrased = set(PLACEHOLDER_PATTERN.findall(paraphrased))
                 if not placeholders_in_original.issubset(placeholders_in_paraphrased):
                     missing = placeholders_in_original - placeholders_in_paraphrased
-                    logging.warning(f"Placeholder(s) {missing} dropped in sentence {i+1}. Reverting.")
+                    extra = placeholders_in_paraphrased - placeholders_in_original
+                    logging.warning(f"Placeholder mismatch in sentence {i+1}. Missing: {missing or 'None'}. Extra: {extra or 'None'}. Reverting sentence.")
                     paraphrased_sentences.append(sentence_with_placeholder); sentences_reverted += 1
-                else: paraphrased_sentences.append(paraphrased)
-            else: paraphrased_sentences.append(paraphrased)
-        logging.info(f"Paraphrasing complete. {sentences_reverted} sentence(s) reverted.")
+                else:
+                    paraphrased_sentences.append(paraphrased) # Placeholders look okay
+            else:
+                paraphrased_sentences.append(paraphrased) # No placeholders to check
+
+        logging.info(f"Paraphrasing complete. Reverted: {sentences_reverted}, Failed: {sentences_failed}.")
         t5_paraphrased_text_with_placeholders = " ".join(paraphrased_sentences)
 
+
         # --- Apply Sentence Splitting ---
+        # Pass the spaCy model loaded earlier
         text_after_splitting_with_placeholders = apply_sentence_splitting(t5_paraphrased_text_with_placeholders, models["nlp"])
 
         # --- Optional Filter Trailing Question ---
+        # This seems very specific, ensure it's still needed. Can be removed if not.
         unwanted_phrase = "Can you provide some examples?"
-        temp_text_lower = text_after_splitting_with_placeholders.rstrip('.?! ').lower()
-        phrase_lower = unwanted_phrase.rstrip('.?! ').lower()
-        text_to_refine_with_placeholders = text_after_splitting_with_placeholders
-        if temp_text_lower.endswith(phrase_lower):
-            logging.info(f"Filtering detected unwanted trailing phrase: '{unwanted_phrase}'")
-            try:
-                phrase_start_index = text_after_splitting_with_placeholders.lower().rindex(phrase_lower)
-                text_to_refine_with_placeholders = text_after_splitting_with_placeholders[:phrase_start_index].rstrip()
-            except Exception as filter_err: logging.warning(f"Error during filtering: {filter_err}")
+        text_to_refine_with_placeholders = text_after_splitting_with_placeholders # Default
+        if unwanted_phrase in text_after_splitting_with_placeholders: # Check if phrase exists anywhere first
+            temp_text_lower = text_after_splitting_with_placeholders.rstrip('.?! ').lower()
+            phrase_lower = unwanted_phrase.rstrip('.?! ').lower()
+            if temp_text_lower.endswith(phrase_lower):
+                logging.info(f"Filtering detected unwanted trailing phrase: '{unwanted_phrase}'")
+                try:
+                    # Find the last occurrence and slice before it
+                    phrase_start_index = text_after_splitting_with_placeholders.lower().rindex(phrase_lower)
+                    text_to_refine_with_placeholders = text_after_splitting_with_placeholders[:phrase_start_index].rstrip()
+                except Exception as filter_err:
+                     logging.warning(f"Error during trailing phrase filtering: {filter_err}")
 
-        # --- Refine with OpenAI ---
+
+        # --- Refine with OpenAI (if client initialized) ---
         refined_text_with_placeholders = refine_with_openai(text_to_refine_with_placeholders, discipline)
+
 
         # --- Re-insert Original Freeze Terms ---
         logging.info("Re-inserting original freeze terms...")
         final_text = refined_text_with_placeholders
+        num_reinserted = 0
 
-        # *** FIX 1: Clean up potential extra spaces around placeholders BEFORE replacing ***
-        if placeholder_map: # Only clean if placeholders were used
+        if placeholder_map: # Only proceed if placeholders were created
+            # Clean up potential extra spaces *around* placeholders BEFORE replacing
             try:
-                # Remove space(s) immediately BEFORE __F...__
-                final_text = re.sub(r'\s+(__F\d+__)', r'\1', final_text)
-                # Remove space(s) immediately AFTER __F...__
-                final_text = re.sub(r'(__F\d+__)\s+', r'\1', final_text)
-                logging.info("Cleaned potential whitespace around placeholders.")
+                # Remove space(s) immediately BEFORE __F...__ unless preceded by sentence start or another placeholder
+                final_text = re.sub(r'(?<!^)(?<!__F\d+__)\s+(__F\d+__)', r'\1', final_text)
+                # Remove space(s) immediately AFTER __F...__ unless followed by sentence end or another placeholder
+                final_text = re.sub(r'(__F\d+__)\s+(?!$)(?!__F\d+__)', r'\1', final_text)
+                logging.info("Attempted cleaning whitespace around placeholders.")
             except Exception as clean_err:
                 logging.warning(f"Could not clean whitespace around placeholders: {clean_err}")
-        # *** END FIX 1 ***
 
-        if placeholder_map:
-            try: sorted_placeholders = sorted(placeholder_map.keys(), key=lambda p: int(PLACEHOLDER_PATTERN.fullmatch(p).group(0).split('__F')[1].split('__')[0]))
-            except Exception as sort_err: logging.error(f"Error sorting placeholders: {sort_err}"); sorted_placeholders = sorted(placeholder_map.keys())
-            num_reinserted = 0
+            # Replace placeholders with original terms (sorted by number for potential order dependency)
+            try:
+                # Sort keys numerically: extract number from __F<num>__
+                sorted_placeholders = sorted(placeholder_map.keys(), key=lambda p: int(re.search(r'\d+', p).group()))
+            except Exception as sort_err:
+                logging.error(f"Error sorting placeholders numerically: {sort_err}. Using default sort.")
+                sorted_placeholders = sorted(placeholder_map.keys())
+
+            final_text_list = list(final_text) # Work with list for efficient replacement? Or use string replace..
+            current_offset = 0 # Track index changes if using list replace
+
+            # Use string replace for simplicity, iterate multiple times if needed for overlaps (though shouldn't happen with sorted longest first)
             for placeholder in sorted_placeholders:
-                original_term = placeholder_map[placeholder]; occurrences = final_text.count(placeholder)
+                original_term = placeholder_map[placeholder]
+                # Replace placeholder with " original_term " to ensure spacing, will clean later
+                # Count occurrences before replacing for logging
+                occurrences = final_text.count(placeholder)
                 if occurrences > 0:
-                    # *** FIX 2: Add spaces around original_term during replacement ***
                     final_text = final_text.replace(placeholder, f" {original_term} ")
                     num_reinserted += occurrences
+
             logging.info(f"{num_reinserted} placeholder instance(s) re-inserted.")
 
-            # *** FIX 3: Clean up potential double spaces AFTER the loop ***
+            # Clean up potential double spaces and spaces around punctuation AFTER all replacements
             final_text = re.sub(r'\s{2,}', ' ', final_text).strip()
-            logging.info("Cleaned up potential double spaces after re-insertion.")
-            # *** END FIX 3 ***
+            final_text = re.sub(r'\s+([.,;?!:])', r'\1', final_text) # Space before punct
+            final_text = re.sub(r'([.,;?!:])([^\s])', r'\1 \2', final_text) # Punct followed by non-space
 
-        else: logging.info("No placeholders used, skipping re-insertion.")
+        else:
+            logging.info("No placeholders were used, skipping re-insertion.")
 
 
         # --- Final Metrics Calculation ---
         logging.info("Calculating final metrics...")
         paraphrased_ai_score, paraphrased_fk_score, paraphrased_burstiness, paraphrased_ttr, paraphrased_word_count, paraphrased_mod_percentage = 0.0, 0.0, 0.0, 0.0, 0, 0.0
         paraphrased_ai_result = {'label': 'N/A', 'score': 0.0}
+
         if final_text and final_text.strip():
-            try: paraphrased_ai_result = models["ai_detector"](final_text)[0]; paraphrased_ai_score = paraphrased_ai_result.get('score', 0.0)
-            except Exception as ai_err: logging.error(f"Error calculating final AI score: {ai_err}"); paraphrased_ai_result = {'label': 'Error', 'score': 0.0}
+            try:
+                # Use the AI detector pipeline loaded earlier
+                # Truncate input to AI detector if necessary (check model's max length)
+                # detector_max_len = models["ai_detector"].model.config.max_position_embeddings
+                # truncated_final_text = models["ai_detector"].tokenizer.decode(models["ai_detector"].tokenizer.encode(final_text, max_length=detector_max_len, truncation=True))
+                # paraphrased_ai_result = models["ai_detector"](truncated_final_text)[0]
+
+                # Assuming detector handles truncation internally or text is within limits:
+                paraphrased_ai_result = models["ai_detector"](final_text)[0]
+                paraphrased_ai_score = paraphrased_ai_result.get('score', 0.0)
+            except Exception as ai_err: logging.error(f"Error calculating final AI score: {ai_err}", exc_info=True); paraphrased_ai_result = {'label': 'Error', 'score': 0.0}
+
             try: paraphrased_fk_score = flesch_kincaid_grade(final_text)
             except Exception as fk_err: logging.error(f"Error calculating final FK score: {fk_err}")
+
             paraphrased_burstiness = calculate_burstiness(final_text)
             paraphrased_ttr = calculate_ttr(final_text)
-            paraphrased_word_count = len(final_text.split())
+            paraphrased_word_count = len(final_text.split()) # Simple word count
             paraphrased_mod_percentage = calculate_modification_percentage(input_text, final_text)
             logging.info("Final metrics calculated.")
-        else: logging.warning("Final text is empty. Setting final metrics to default values.")
+        else:
+            logging.warning("Final text is empty. Setting final metrics to default values.")
+
 
         # --- Final Freeze Term Preservation Check ---
-        # *** Using Improved Regex Check ***
         final_freeze_terms_preserved = True
-        if placeholder_map:
-            logging.info(f"Verifying placeholder re-insertion in final output...")
+        if placeholder_map: # Only check if placeholders were supposed to be there
+            logging.info(f"Verifying placeholder removal in final output...")
             if PLACEHOLDER_PATTERN.search(final_text):
                 remaining_found = PLACEHOLDER_PATTERN.findall(final_text)
                 logging.warning(f"Placeholder(s) still found in final output after re-insertion: {set(remaining_found)}")
                 final_freeze_terms_preserved = False
             else:
-                logging.info("All placeholders appear to have been re-inserted successfully.")
+                logging.info("All placeholders appear to have been removed/replaced successfully.")
         else:
             logging.info("No freeze terms were used, skipping final verification.")
-            final_freeze_terms_preserved = True
+            # final_freeze_terms_preserved remains True
 
 
         # --- Structure Output Data ---
         output_data = {
             "status": "success",
-            # Only include final results for the API response
-            "Final Output Text": final_text,
+            # Renamed key for clarity based on your variable name
+            "final_text": final_text,
             "final_metrics": {
                 "ai_score_label": paraphrased_ai_result.get('label', 'N/A'),
                 "ai_score_value": round(paraphrased_ai_score, 4),
@@ -950,100 +1181,129 @@ def process_text(
                 "type_token_ratio": round(paraphrased_ttr, 4),
                 "modification_percentage": round(paraphrased_mod_percentage, 2),
                 "word_count": paraphrased_word_count,
-                "freeze_terms_preserved": final_freeze_terms_preserved # Use the result of the improved check
+                "freeze_terms_preserved": final_freeze_terms_preserved
             }
-            # Optional: Add back intermediate steps here if needed for debugging
-            # "T5_Output_Placeholders": t5_paraphrased_text_with_placeholders,
-            # "Split_Output_Placeholders": text_after_splitting_with_placeholders,
-            # "GPT_Input_Placeholders": text_to_refine_with_placeholders,
-            # "GPT_Output_Placeholders": refined_text_with_placeholders,
+            # Removed intermediate results keys as per your optimization comment
         }
         end_process_time = time.time()
         logging.info(f"--- Processing Finished (Request Time: {end_process_time - start_process_time:.2f} seconds) ---")
         return output_data
 
     except Exception as e:
-        logging.exception("An unexpected error occurred during core text processing:")
+        logging.exception("An unexpected error occurred during core text processing:") # Log full traceback
+        # Return a structured error message
         return {'status': 'error', 'message': f"An unexpected processing error occurred: {str(e)}"}
+
+
+# >>> START OF PART 4 <<<
 
 # ==============================================================================
 # 10. FLASK APP INITIALIZATION
 # ==============================================================================
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+CORS(app) # Enable CORS for all routes - configure origins properly for production
+
+# Optional: Configure Flask settings if needed (e.g., SECRET_KEY for sessions)
+# app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'default-secret-key-change-me')
+
+
 # ==============================================================================
-# 11. GLOBAL MODEL LOADING (Executed once when Flask starts)
+# 11. GLOBAL MODEL LOADING (Executed once when Flask app/worker starts)
 # ==============================================================================
-# Load models globally when the Flask app starts
+# >>> THIS IS WHERE MODELS ARE LOADED GLOBALLY <<<
 logging.info("Initializing Flask app and loading models...")
-# Use the function defined above
+# Call the model loading function defined in Section 8
 loaded_models_global = load_models(device_preference=CONFIG.get("default_device", "auto"))
+
 if not loaded_models_global:
-    logging.critical("FATAL: Models failed to load. Flask app cannot serve requests properly.")
-    # In a production scenario, you might want the app to exit or signal an error state.
-    # For now, it will just log the error, and the endpoint will return an error message.
+    logging.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    logging.critical("FATAL: Models failed to load during application startup.")
+    logging.critical("The /humanize endpoint will return an error until models load successfully.")
+    logging.critical("Check logs above for specific model loading errors.")
+    logging.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    # The application will start, but the endpoint will check loaded_models_global
+    # and return an error if it's None.
 else:
-    logging.info("Global models loaded successfully. Flask app ready.")
+    logging.info("********************************************************")
+    logging.info("Global models loaded successfully. Flask app is ready.")
+    logging.info(f"Using device: {loaded_models_global.get('device', 'UNKNOWN')}")
+    logging.info("********************************************************")
+
 
 # ==============================================================================
-# 12. FLASK API ENDPOINT
+# 12. FLASK API ENDPOINTS
 # ==============================================================================
 
-@app.route('/', methods=['POST'])
+# Basic root endpoint for testing if the server is reachable
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    if request.method == 'POST':
-        return 'POST received!'
-    return 'GET received!'
+    # Simple check endpoint
+    method = request.method
+    logging.info(f"Root endpoint '/' received a {method} request.")
+    return jsonify({"status": "ok", "message": f"TextPulse backend alive. Received {method}."}), 200
+
 
 @app.route('/humanize', methods=['POST'])
 def humanize_endpoint():
-    """API endpoint to process text."""
+    """API endpoint to process text using pre-loaded models."""
     start_request_time = time.time()
     logging.info(f"Received request for /humanize from {request.remote_addr}")
 
-    # Check if models loaded correctly during startup
+    # --- CRITICAL CHECK: Ensure models loaded successfully at startup ---
     if not loaded_models_global:
-        logging.error("Models not loaded, cannot process request.")
-        return jsonify({"status": "error", "message": "Backend models are not loaded or failed to load."}), 503 # Service Unavailable
+        logging.error("Models were not loaded during startup, cannot process request.")
+        # Return 503 Service Unavailable, as the service is fundamentally not ready
+        return jsonify({"status": "error", "message": "Service Unavailable: Backend models failed to load."}), 503
 
+    # --- Get and Validate Input Data ---
+    if not request.is_json:
+        logging.warning("Request Content-Type is not application/json.")
+        return jsonify({"status": "error", "message": "Invalid request format: Content-Type must be application/json"}), 415 # Unsupported Media Type
+
+    data = request.get_json()
+    if not data:
+        logging.warning("Received empty JSON payload.")
+        return jsonify({"status": "error", "message": "No input data received"}), 400 # Bad Request
+
+    input_text = data.get('text')
+    discipline = data.get('discipline', DEFAULT_DISCIPLINE)
+    freeze_terms = data.get('freeze_terms', [])
+
+    # --- Basic Input Validation ---
+    if not input_text: # Check if text exists and is not just whitespace
+        logging.warning("Request missing 'text' field or text is empty.")
+        return jsonify({"status": "error", "message": "Input 'text' is required and cannot be empty"}), 400
+    if not isinstance(freeze_terms, list):
+        logging.warning(f"Received 'freeze_terms' is not a list (Type: {type(freeze_terms)}).")
+        return jsonify({"status": "error", "message": "'freeze_terms' must be a list of strings"}), 400
+    # Ensure all freeze terms are strings (or handle potential errors)
+    if not all(isinstance(term, str) for term in freeze_terms):
+         logging.warning("Received 'freeze_terms' contains non-string elements.")
+         return jsonify({"status": "error", "message": "'freeze_terms' must be a list of strings"}), 400
+
+    if discipline not in VALID_DISCIPLINES:
+        logging.warning(f"Received invalid discipline '{discipline}', using default '{DEFAULT_DISCIPLINE}'.")
+        discipline = DEFAULT_DISCIPLINE
+
+
+    # --- Call Core Processing Logic ---
     try:
-        # --- Get and Validate Input Data ---
-        data = request.get_json()
-        if not data:
-            logging.warning("Received empty request data.")
-            return jsonify({"status": "error", "message": "No input data received"}), 400
-
-        input_text = data.get('text')
-        discipline = data.get('discipline', DEFAULT_DISCIPLINE)
-        freeze_terms = data.get('freeze_terms', [])
-
-        if not input_text:
-            logging.warning("Request missing 'text' field.")
-            return jsonify({"status": "error", "message": "Input 'text' is required"}), 400
-        if not isinstance(freeze_terms, list):
-             logging.warning("Received 'freeze_terms' is not a list.")
-             return jsonify({"status": "error", "message": "'freeze_terms' must be a list"}), 400
-        if discipline not in VALID_DISCIPLINES:
-             logging.warning(f"Received invalid discipline '{discipline}', using default '{DEFAULT_DISCIPLINE}'.")
-             discipline = DEFAULT_DISCIPLINE
-
-        # --- Call Core Processing Logic ---
-        # Pass the globally loaded models
+        # Pass the globally loaded models dictionary
         result_dict = process_text(
             input_text=input_text,
             freeze_terms=freeze_terms,
             discipline=discipline,
-            models=loaded_models_global,
+            models=loaded_models_global, # Use the models loaded at startup
             config=CONFIG
         )
 
         # --- Prepare and Return Response ---
         if result_dict.get("status") == "success":
-            # *** Optimization: Return only final text and metrics ***
+            # Return only the final text and metrics as specified
             response_data = {
                 "status": "success",
-                "final_text": result_dict.get("Final Output Text", ""), # Default to empty string if key missing
-                "final_metrics": result_dict.get("final_metrics", {})   # Default to empty dict if key missing
+                "final_text": result_dict.get("final_text", ""), # Use the correct key from process_text output
+                "final_metrics": result_dict.get("final_metrics", {})
             }
             status_code = 200
         else:
@@ -1052,39 +1312,69 @@ def humanize_endpoint():
                 "status": "error",
                 "message": result_dict.get('message', 'Unknown processing error')
             }
-            # Use 500 for internal server errors, maybe 422 (Unprocessable Entity) for validation errors caught in process_text
-            status_code = 500 if "unexpected" in result_dict.get('message', '').lower() else 422
+            # Determine status code based on error type if possible
+            # 422: Unprocessable Entity (validation errors within process_text)
+            # 500: Internal Server Error (unexpected errors)
+            msg_lower = response_data['message'].lower()
+            if "word limit" in msg_lower or "token limit" in msg_lower or "no valid sentences" in msg_lower:
+                 status_code = 422
+            else:
+                 status_code = 500
 
         end_request_time = time.time()
         logging.info(f"Request processed in {end_request_time - start_request_time:.2f} seconds. Status: {status_code}")
         return jsonify(response_data), status_code
 
     except Exception as e:
-        # Catch-all for errors within the endpoint logic itself
-        logging.error("An error occurred processing the /humanize request:", exc_info=True)
-        return jsonify({"status": "error", "message": f"An internal server error occurred processing the request."}), 500
+        # Catch-all for unexpected errors *within the endpoint logic itself*
+        # Errors within process_text should be caught and returned by that function.
+        logging.exception("An unexpected error occurred within the /humanize endpoint:") # Log full traceback
+        return jsonify({"status": "error", "message": f"An internal server error occurred while handling the request."}), 500
+
 
 # ==============================================================================
-# 13. MAIN EXECUTION BLOCK (For Running the Server)
+# 13. MAIN EXECUTION BLOCK (For Running the Server Directly)
 # ==============================================================================
 if __name__ == '__main__':
-    # Instructions for running in production:
-    print("\n--- TextPulse Flask Server ---")
-    print("To run in production (on DigitalOcean, etc.), use Gunicorn:")
-    print("Example: gunicorn --workers 2 --bind 0.0.0.0:5000 app:app")
-    print("  (Replace 'app:app' with 'your_filename:app')")
-    print("  Adjust '--workers' based on your server's CPU cores and RAM.")
-    print("---------------------------------")
+    # This block runs only when the script is executed directly (e.g., `python your_script.py`)
+    # It's primarily for local development and testing.
 
-    # Run the Flask development server (for local testing ONLY)
-    # NOTE: debug=True automatically reloads on code changes but can consume more memory.
-    #       Set debug=False for more realistic performance/memory testing locally.
-    print("\nStarting Flask development server (for testing only)...")
-    app.run(debug=False, host='0.0.0.0', port=5001) # Use a specific port
+    print("\n" + "="*60)
+    print("--- TextPulse Flask Server ---")
+    print("="*60)
+    print("\n >> Running in direct execution mode (for development/testing) <<\n")
+
+    print(" --- Deployment Instructions ---")
+    print(" For production (e.g., on DigitalOcean with Gunicorn):")
+    print(" 1. Ensure Gunicorn is installed: pip install gunicorn")
+    print(" 2. Run using a command like:")
+    # Assuming your script is named 'app.py'. Change 'app:app' if filename or Flask app variable name differs.
+    print("    gunicorn --workers 2 --threads 2 --bind 0.0.0.0:5000 app:app --timeout 120")
+    print("    - Adjust '--workers' (processes) based on CPU cores (e.g., 2*cores + 1).")
+    print("    - Adjust '--threads' (per worker) based on workload (start with 2-4).")
+    print("    - Adjust '--timeout' (seconds) if requests take longer (default is 30s).")
+    print("    - Ensure sufficient RAM for the number of workers * model size.")
+    print("    - Consider running behind a reverse proxy like Nginx.")
+    print(" -----------------------------")
+
+    # Run the Flask development server
+    # Set debug=False to mimic production loading behavior more closely (no auto-reload)
+    # Set debug=True for auto-reloading on code changes during active development (will reload models on change).
+    flask_debug_mode = False # Set to True only for active code modification testing
+    flask_port = 5001 # Use a distinct port for development server
+
+    print(f"\nStarting Flask development server on http://0.0.0.0:{flask_port}/")
+    print(f" --> DEBUG MODE: {'ON (Auto-reload enabled)' if flask_debug_mode else 'OFF (Production-like loading)'} <--")
+    print(" (Use Ctrl+C to stop)")
+    print("="*60 + "\n")
+
+    # Note: app.run() is NOT suitable for production deployment.
+    app.run(debug=flask_debug_mode, host='0.0.0.0', port=flask_port)
 
 # ==============================================================================
-# 14. FINAL SCRIPT DOCSTRING (Summary - Optional but good practice)
+# 14. FINAL SCRIPT DOCSTRING (Redundant if top one is detailed)
 # ==============================================================================
 """
-(See detailed feature summary in the main docstring at the top of the file)
+End of TextPulse.ai Flask Backend Script.
+Provides the /humanize API endpoint with pre-loaded ML models.
 """
