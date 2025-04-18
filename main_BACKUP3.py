@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TextPulse.ai Backend Flask Application (v13.9 - Optimized - No AI Detector)
+TextPulse.ai Backend Flask Application (v13.9 - Optimized)
 
 This script runs a Flask web server providing an API endpoint (/humanize)
 to process text according to the TextPulse logic. It's designed for
@@ -8,13 +8,12 @@ deployment on a server (e.g., DigitalOcean) to backend a web application
 (e.g., built with Bubble.io).
 
 Key Optimizations Implemented:
-- Models (spaCy, T5) are loaded ONCE on application startup.
-- AI Detector (RoBERTa) functionality has been REMOVED.
+- Models (spaCy, T5, RoBERTa) are loaded ONCE on application startup.
 - Unused spaCy pipeline components ('ner') are disabled.
-- The API endpoint returns only the final processed text and final metrics (excluding AI score).
+- The API endpoint returns only the final processed text and final metrics.
 
 Workflow:
-1. Server starts, loads spaCy and T5 models into memory.
+1. Server starts, loads all models into memory.
 2. Receives POST requests at /humanize with JSON data:
    { "text": "...", "discipline": "...", "freeze_terms": [...] }
 3. Processes the text using the loaded models and defined logic.
@@ -23,7 +22,7 @@ Workflow:
    or an error message.
 
 Deployment Note: Run using a production WSGI server like Gunicorn.
-Example: gunicorn --bind 0.0.0.0:5000 main:app (replace main with your filename)
+Example: gunicorn --bind 0.0.0.0:5000 app:app (replace app with your filename)
 Ensure sufficient RAM on the server (8GB+ recommended).
 
 WARNING: Contains hardcoded API key for testing - REMOVE BEFORE SHARING/COMMIT.
@@ -55,15 +54,13 @@ from flask_cors import CORS
 try:
     import spacy
     import torch
-    import transformers # Still needed for T5
+    import transformers
     import openai
     from textstat import flesch_kincaid_grade # Import specific function
-    # AutoTokenizer and AutoModelForSeq2SeqLM are for T5, pipeline removed as it was only for detector
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, set_seed
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, set_seed
 except ImportError as e:
     print(f"FATAL Error: Missing required library: {e}. Please install requirements.")
-    # Removed 'pipeline' from suggested install if only used for detector
-    print("Try: pip install Flask flask-cors spacy torch transformers openai textstat python-dotenv")
+    print("Try: pip install Flask flask-cors spacy torch transformers openai textstat python-dotenv") # Added flask-cors and python-dotenv here
     # Exit if core dependencies are missing
     sys.exit(1)
 
@@ -82,7 +79,7 @@ DEBUG_SPLITTING = False # Set True for detailed sentence splitting logs
 CONFIG = {
     "spacy_model": "en_core_web_sm",
     "paraphraser_model": "humarin/chatgpt_paraphraser_on_T5_base",
-    # "ai_detector_model": "roberta-base-openai-detector", # REMOVED AI DETECTOR MODEL CONFIG
+    "ai_detector_model": "roberta-base-openai-detector",
     "default_device": "auto", # "auto", "cpu", "cuda"
     "paraphrase_num_beams": 5,
     "paraphrase_max_length": 512,
@@ -132,6 +129,9 @@ if not openai_api_key or not openai_api_key.startswith("sk-"):
 else:
     try:
         openai_client = openai.OpenAI(api_key=openai_api_key)
+        # Optional: Test connection (add timeout)
+        # You might want to remove this test call in production to avoid unnecessary API calls on startup.
+        # openai_client.with_options(timeout=10.0).models.list()
         logging.info("OpenAI client initialized successfully using environment variable.")
     except Exception as e:
         logging.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
@@ -174,6 +174,8 @@ def calculate_ttr(text: str) -> float:
     unique_types = len(set(words))
     return unique_types / total_tokens
 
+# >>> START OF PART 2 <<<
+
 # ==============================================================================
 # 5. HELPER FUNCTIONS: PARAPHRASING
 # ==============================================================================
@@ -200,6 +202,7 @@ def paraphrase_sentence(
              logging.warning(f"Input sentence encoding length ({input_ids.shape[1]}) exceeded max_length ({max_length}) even after truncation. Output might be poor. Sentence: '{sentence_with_placeholders[:50]}...'")
              # Optionally truncate again, though tokenizer should handle this
              input_ids = input_ids[:, :max_length]
+
 
         outputs = model.generate(
             input_ids=input_ids, num_beams=num_beams, max_length=max_length, early_stopping=True,
@@ -366,6 +369,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                         should_prevent_split_cc = True
                         logging.debug(f"    DEBUG CC Prevent (2e): Likely list coord with comma ('{t_before_comma.text}, {token.text} {t_after_conj.text}')") if DEBUG_SPLITTING else None
 
+
             # Fallback S/V Check for CC if no context rule prevented it
             if not should_prevent_split_cc:
                 cl1_span_cc = sentence_doc[0 : i]; cl2_span_cc = sentence_doc[i + 1 : sent_len]
@@ -497,6 +501,7 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
                 if DEBUG_SPLITTING: logging.debug(f"  DEBUG: SUCCESS (Pass 2) - Splitting at ':' (Index {i}) based on S/V check in second clause.")
                 return token # Return colon token
 
+
     # --- Rule 2.8 (Check after Pass 2): Initial SCONJ + Comma separating clauses ---
     first_real_token_idx = 0
     # Skip initial placeholders
@@ -540,14 +545,13 @@ def find_split_token(sentence_doc: spacy.tokens.Span) -> Optional[Union[spacy.to
 
                 break # Found the first comma after the SCONJ, decision made based on S/V
 
+
     # --- No split point found by any rule ---
     if DEBUG_SPLITTING and sent_len > 10: # Only log if sentence is reasonably long
         logging.debug(f"DEBUG: No valid split point found for sentence: '{sentence_doc.text[:100]}...'")
     return None
 
-# --- END OF PART 1 ---
-
-# --- START OF PART 2 ---
+# >>> START OF PART 3 <<<
 
 # ==============================================================================
 # 6. HELPER FUNCTIONS: SENTENCE SPLITTING (Part 2 - Application Logic)
@@ -813,11 +817,11 @@ def refine_with_openai(text_with_placeholders: str, discipline: str) -> str:
         return text_with_placeholders # Return original on error
 
 # ==============================================================================
-# 8. MODEL LOADING FUNCTION (Modified - AI Detector Removed)
+# 8. MODEL LOADING FUNCTION (Optimized - Called once at startup)
 # ==============================================================================
 def load_models(device_preference: str = "auto") -> Optional[Dict[str, Any]]:
-    """Loads and initializes NLP models (spaCy, Paraphraser), disabling unused spaCy components."""
-    logging.info("--- Loading Models (AI Detector Removed) ---")
+    """Loads and initializes NLP models (spaCy, Paraphraser, AI Detector), disabling unused spaCy components."""
+    logging.info("--- Loading Models ---")
     models = {}
 
     # Determine compute device (CUDA if available, otherwise CPU)
@@ -840,6 +844,7 @@ def load_models(device_preference: str = "auto") -> Optional[Dict[str, Any]]:
         # Load spaCy model
         spacy_model_name = CONFIG['spacy_model']
         # *** Optimization: Disable unused components like 'ner' ***
+        # Adjust 'disable' list based on actual components needed by your splitting logic (parser, tagger are likely needed)
         disabled_spacy_components = ['ner']
         logging.info(f"Loading spaCy model: {spacy_model_name} (disabling: {disabled_spacy_components})...")
         try:
@@ -865,29 +870,27 @@ def load_models(device_preference: str = "auto") -> Optional[Dict[str, Any]]:
         models["model"].eval() # Set model to evaluation mode
         logging.info("Paraphraser model loaded.")
 
-        # --- AI Detector Loading Block REMOVED ---
-        # ai_detector_model_name = CONFIG.get('ai_detector_model') # Use .get() in case key is missing
-        # if ai_detector_model_name:
-        #     logging.info(f"Loading AI detector: {ai_detector_model_name}...")
-        #     # ... (pipeline loading code was here) ...
-        #     logging.info("AI detector pipeline loaded.")
-        # else:
-        #     logging.warning("AI detector model name not found in config. Skipping AI detector loading.")
-        #     models["ai_detector"] = None # Explicitly set to None if not loaded
+        # Load AI Detector (RoBERTa based)
+        ai_detector_model_name = CONFIG['ai_detector_model']
+        logging.info(f"Loading AI detector: {ai_detector_model_name}...")
+        # Use device mapping for pipeline (-1 for CPU, 0 for first GPU, etc.)
+        pipeline_device = 0 if models["device"].type == 'cuda' else -1
+        # Temporarily reduce transformers logging during pipeline load if desired
+        previous_verbosity = transformers.logging.get_verbosity()
+        transformers.logging.set_verbosity_error()
+        models["ai_detector"] = pipeline("text-classification", model=ai_detector_model_name, device=pipeline_device)
+        transformers.logging.set_verbosity(previous_verbosity) # Restore verbosity
+        logging.info("AI detector pipeline loaded.")
 
-        logging.info("--- Required models (spaCy, T5) loaded successfully ---")
+        logging.info("--- All models loaded successfully ---")
         return models
 
     except Exception as e:
         logging.exception("Fatal error during model loading:") # Log the full traceback
         return None
 
-# --- END OF PART 2 ---
-
-# --- START OF PART 3 ---
-
 # ==============================================================================
-# 9. CORE PROCESSING FUNCTION (Modified - AI Score Calculation Removed)
+# 9. CORE PROCESSING FUNCTION
 # ==============================================================================
 def process_text(
     input_text: str, freeze_terms: List[str], discipline: str,
@@ -912,75 +915,69 @@ def process_text(
     start_process_time = time.time()
 
     try:
-        # --- Auto-detect and Add Citations to Freeze Terms ---
-        try:
-            citation_pattern = re.compile(r'\[\d+\]')
-            detected_citations = set(citation_pattern.findall(input_text))
-
-            if detected_citations:
-                logging.info(f"Auto-detecting citations: {detected_citations}")
-                if not isinstance(freeze_terms, list): freeze_terms = []
-                original_freeze_term_count = len(freeze_terms)
-                for cit in detected_citations:
-                    if cit not in freeze_terms:
-                        freeze_terms.append(cit)
-                if len(freeze_terms) > original_freeze_term_count:
-                    freeze_terms_sorted = sorted([ft for ft in freeze_terms if ft and ft.strip()], key=len, reverse=True)
-                    logging.info(f"Added {len(detected_citations)} unique citation patterns to freeze terms.")
-                else: # Citations found but already in freeze_terms
-                     freeze_terms_sorted = sorted([ft for ft in freeze_terms if ft and ft.strip()], key=len, reverse=True)
-            else:
-                logging.info("No simple bracketed citations '[n]' found for auto-freezing.")
-                freeze_terms_sorted = sorted([ft for ft in freeze_terms if ft and ft.strip()], key=len, reverse=True)
-
-        except Exception as cit_err:
-            logging.error(f"Error during citation auto-detection: {cit_err}", exc_info=True)
-            freeze_terms_sorted = sorted([ft for ft in freeze_terms if ft and ft.strip()], key=len, reverse=True)
-
         # --- Placeholder Replacement ---
         placeholder_map: Dict[str, str] = {}
         text_with_placeholders = input_text
         placeholder_counter = 0
+        # Filter and sort freeze terms (longest first to avoid partial replacements)
+        freeze_terms_sorted = sorted([ft for ft in freeze_terms if ft and ft.strip()], key=len, reverse=True)
 
         if freeze_terms_sorted:
-            logging.info(f"Processing {len(freeze_terms_sorted)} freeze term type(s) (including auto-detected citations)...")
-            processed_spans_map: Dict[int, Tuple[int, str]] = {}
+            logging.info(f"Replacing {len(freeze_terms_sorted)} freeze term type(s) with placeholders...")
+            processed_spans_map: Dict[int, Tuple[int, str]] = {} # Store start -> (end, placeholder)
+
+            # Iterate through sorted terms to find and mark replacements
             for term in freeze_terms_sorted:
                 term_stripped = term.strip()
-                if not term_stripped: continue
+                if not term_stripped: continue # Skip empty terms
+
                 try:
-                    pattern = re.compile(re.escape(term_stripped), re.IGNORECASE)
+                    # Use word boundaries for more precise matching, case-insensitive
+                    # Note: \b might not work well with punctuation attached. Simple escape might be safer.
+                    # pattern = re.compile(r'\b' + re.escape(term_stripped) + r'\b', re.IGNORECASE)
+                    pattern = re.compile(re.escape(term_stripped), re.IGNORECASE) # Safer default
                     matches_this_term = []
-                    for match in pattern.finditer(text_with_placeholders):
+                    # Find all non-overlapping matches for *this specific term*
+                    for match in pattern.finditer(text_with_placeholders): # Search in the current state of text_with_placeholders
                         start, end = match.span()
+                        # Check for overlaps with already processed spans
                         is_overlapping = any(max(start, ps) < min(end, pe) for ps, (pe, _) in processed_spans_map.items())
                         if not is_overlapping:
                             matches_this_term.append(match)
+
+                    # If matches found, create placeholder and mark spans
                     if matches_this_term:
-                        original_term_matched = matches_this_term[0].group(0)
+                        original_term_matched = matches_this_term[0].group(0) # Use the case from the first match
                         placeholder = f"__F{placeholder_counter}__"
                         placeholder_map[placeholder] = original_term_matched
                         placeholder_counter += 1
+                        # Mark all non-overlapping matches for this term with the *same* placeholder
                         for match in matches_this_term:
                             processed_spans_map[match.start()] = (match.end(), placeholder)
+
                 except re.error as regex_err: logging.warning(f"Regex error for freeze term '{term_stripped}': {regex_err}")
                 except Exception as term_err: logging.warning(f"Error processing freeze term '{term_stripped}': {term_err}")
 
+            # Perform replacements using the marked spans (from right to left to avoid index issues)
             if processed_spans_map:
                 sorted_starts = sorted(processed_spans_map.keys(), reverse=True)
                 temp_text_list = list(text_with_placeholders)
                 for start in sorted_starts:
                     end, placeholder = processed_spans_map[start]
-                    temp_text_list[start:end] = list(placeholder)
+                    temp_text_list[start:end] = list(placeholder) # Replace slice with placeholder chars
                 text_with_placeholders = "".join(temp_text_list)
                 logging.info(f"{placeholder_counter} placeholder type(s) created, corresponding to {len(processed_spans_map)} replacements.")
+
         else:
-            logging.info("No freeze terms (user-provided or auto-detected) to process.")
+            logging.info("No valid freeze terms provided or found.")
+
 
         # --- Paraphrasing Sentences ---
         logging.info("Tokenizing text (with placeholders) into sentences...")
         try:
+            # Use spaCy model loaded earlier
             doc = models["nlp"](text_with_placeholders)
+            # Filter empty sentences after stripping whitespace
             sentences = [s.text.strip() for s in doc.sents if s.text and s.text.strip()]
             if not sentences:
                  logging.error("No valid sentences found after placeholder replacement and tokenization.")
@@ -989,127 +986,176 @@ def process_text(
             logging.error(f"Sentence tokenization failed: {nlp_err}", exc_info=True)
             return {'status': 'error', 'message': f'Sentence tokenization failed: {nlp_err}'}
 
+        # Optional: Check length of original sentences before paraphrasing (can be slow)
+        # try:
+        #     original_doc = models["nlp"](input_text)
+        #     original_sentences_map = {i: s.text.strip() for i, s in enumerate(original_doc.sents) if s.text.strip()}
+        # except Exception as nlp_err_orig:
+        #     logging.warning(f"Could not tokenize original text for length check: {nlp_err_orig}"); original_sentences_map = {}
+
         paraphrased_sentences = []; sentences_reverted = 0; sentences_failed = 0
         logging.info(f"Paraphrasing {len(sentences)} sentences...")
         max_sentence_tokens = config.get("input_max_sentence_tokens", 480)
+
         for i, sentence_with_placeholder in enumerate(sentences):
-             try:
-                 check_text = f"paraphrase: {sentence_with_placeholder}"
-                 sentence_tokens = models["tokenizer"].encode(check_text, max_length=max_sentence_tokens + 10, truncation=False)
-                 if len(sentence_tokens) > max_sentence_tokens:
-                     msg = f"Warning: Sentence #{i+1} exceeds token limit for paraphraser ({len(sentence_tokens)}/{max_sentence_tokens}). Skipping paraphrase."
-                     logging.warning(msg)
-                     paraphrased_sentences.append(sentence_with_placeholder); sentences_reverted += 1
-                     continue
-             except Exception as token_err:
-                 logging.warning(f"Tokenization failed for length check on sentence {i+1}: {token_err}")
+             # Check token length *before* paraphrasing (using the paraphraser tokenizer)
+            try:
+                # Include the "paraphrase: " prefix in length check if applicable to model
+                check_text = f"paraphrase: {sentence_with_placeholder}"
+                sentence_tokens = models["tokenizer"].encode(check_text, max_length=max_sentence_tokens + 10, truncation=False) # Check without truncating initially
+                if len(sentence_tokens) > max_sentence_tokens:
+                    msg = f"Error: Sentence #{i+1} (with placeholders) exceeds token limit for paraphraser ({len(sentence_tokens)}/{max_sentence_tokens}). Skipping paraphrase for this sentence."
+                    logging.warning(msg)
+                    # Option 1: Skip paraphrase, keep original (with placeholders)
+                    paraphrased_sentences.append(sentence_with_placeholder); sentences_reverted += 1
+                    # Option 2: Return error immediately (uncomment below)
+                    # return { 'status': 'error', 'message': msg.replace("Error: ","") }
+                    continue # Move to next sentence
+            except Exception as token_err:
+                logging.warning(f"Tokenization failed for length check on sentence {i+1}: {token_err}")
+                # Decide how to handle - proceed cautiously or skip/error
 
-             paraphrased = paraphrase_sentence(
-                 sentence_with_placeholder, models["model"], models["tokenizer"],
-                 config["paraphrase_num_beams"], config["paraphrase_max_length"]
-             )
-             if "[Paraphrasing Error:" in paraphrased or "[Encoding Error]" in paraphrased:
-                 logging.error(f"Paraphrasing failed for sentence {i+1}: {paraphrased}")
-                 paraphrased_sentences.append(sentence_with_placeholder); sentences_failed += 1
-                 continue
 
-             placeholders_in_original = set(PLACEHOLDER_PATTERN.findall(sentence_with_placeholder))
-             if placeholders_in_original:
-                 placeholders_in_paraphrased = set(PLACEHOLDER_PATTERN.findall(paraphrased))
-                 if not placeholders_in_original.issubset(placeholders_in_paraphrased):
-                     missing = placeholders_in_original - placeholders_in_paraphrased
-                     extra = placeholders_in_paraphrased - placeholders_in_original
-                     logging.warning(f"Placeholder mismatch sentence {i+1}. Missing: {missing or 'None'}. Extra: {extra or 'None'}. Reverting.")
-                     paraphrased_sentences.append(sentence_with_placeholder); sentences_reverted += 1
-                 else:
-                     paraphrased_sentences.append(paraphrased)
-             else:
-                 paraphrased_sentences.append(paraphrased)
+            # Proceed with paraphrasing
+            paraphrased = paraphrase_sentence(
+                sentence_with_placeholder,
+                models["model"], models["tokenizer"],
+                config["paraphrase_num_beams"], config["paraphrase_max_length"]
+            )
+
+            # Check for paraphrasing errors
+            if "[Paraphrasing Error:" in paraphrased or "[Encoding Error]" in paraphrased:
+                logging.error(f"Paraphrasing failed for sentence {i+1}: {paraphrased}")
+                # Option 1: Keep original sentence
+                paraphrased_sentences.append(sentence_with_placeholder); sentences_failed += 1
+                # Option 2: Return error immediately (uncomment below)
+                # return {'status': 'error', 'message': f"Error paraphrasing sentence #{i+1}: {paraphrased}"}
+                continue # Move to next sentence
+
+            # Verify placeholder preservation (crucial!)
+            placeholders_in_original = set(PLACEHOLDER_PATTERN.findall(sentence_with_placeholder))
+            if placeholders_in_original:
+                placeholders_in_paraphrased = set(PLACEHOLDER_PATTERN.findall(paraphrased))
+                if not placeholders_in_original.issubset(placeholders_in_paraphrased):
+                    missing = placeholders_in_original - placeholders_in_paraphrased
+                    extra = placeholders_in_paraphrased - placeholders_in_original
+                    logging.warning(f"Placeholder mismatch in sentence {i+1}. Missing: {missing or 'None'}. Extra: {extra or 'None'}. Reverting sentence.")
+                    paraphrased_sentences.append(sentence_with_placeholder); sentences_reverted += 1
+                else:
+                    paraphrased_sentences.append(paraphrased) # Placeholders look okay
+            else:
+                paraphrased_sentences.append(paraphrased) # No placeholders to check
 
         logging.info(f"Paraphrasing complete. Reverted: {sentences_reverted}, Failed: {sentences_failed}.")
         t5_paraphrased_text_with_placeholders = " ".join(paraphrased_sentences)
 
+
         # --- Apply Sentence Splitting ---
+        # Pass the spaCy model loaded earlier
         text_after_splitting_with_placeholders = apply_sentence_splitting(t5_paraphrased_text_with_placeholders, models["nlp"])
 
         # --- Optional Filter Trailing Question ---
+        # This seems very specific, ensure it's still needed. Can be removed if not.
         unwanted_phrase = "Can you provide some examples?"
-        text_to_refine_with_placeholders = text_after_splitting_with_placeholders
-        if unwanted_phrase in text_after_splitting_with_placeholders:
+        text_to_refine_with_placeholders = text_after_splitting_with_placeholders # Default
+        if unwanted_phrase in text_after_splitting_with_placeholders: # Check if phrase exists anywhere first
             temp_text_lower = text_after_splitting_with_placeholders.rstrip('.?! ').lower()
             phrase_lower = unwanted_phrase.rstrip('.?! ').lower()
             if temp_text_lower.endswith(phrase_lower):
                 logging.info(f"Filtering detected unwanted trailing phrase: '{unwanted_phrase}'")
                 try:
+                    # Find the last occurrence and slice before it
                     phrase_start_index = text_after_splitting_with_placeholders.lower().rindex(phrase_lower)
                     text_to_refine_with_placeholders = text_after_splitting_with_placeholders[:phrase_start_index].rstrip()
                 except Exception as filter_err:
                      logging.warning(f"Error during trailing phrase filtering: {filter_err}")
 
-        # --- Refine with OpenAI ---
+
+        # --- Refine with OpenAI (if client initialized) ---
         refined_text_with_placeholders = refine_with_openai(text_to_refine_with_placeholders, discipline)
+
 
         # --- Re-insert Original Freeze Terms ---
         logging.info("Re-inserting original freeze terms...")
         final_text = refined_text_with_placeholders
         num_reinserted = 0
-        if placeholder_map:
+
+        if placeholder_map: # Only proceed if placeholders were created
+            # Clean up potential extra spaces *around* placeholders BEFORE replacing
             try:
+                # Remove space(s) immediately BEFORE __F...__ unless preceded by sentence start or another placeholder
                 final_text = re.sub(r'(?<!^)(?<!__F\d+__)\s+(__F\d+__)', r'\1', final_text)
+                # Remove space(s) immediately AFTER __F...__ unless followed by sentence end or another placeholder
                 final_text = re.sub(r'(__F\d+__)\s+(?!$)(?!__F\d+__)', r'\1', final_text)
                 logging.info("Attempted cleaning whitespace around placeholders.")
             except Exception as clean_err:
                 logging.warning(f"Could not clean whitespace around placeholders: {clean_err}")
+
+            # Replace placeholders with original terms (sorted by number for potential order dependency)
             try:
+                # Sort keys numerically: extract number from __F<num>__
                 sorted_placeholders = sorted(placeholder_map.keys(), key=lambda p: int(re.search(r'\d+', p).group()))
             except Exception as sort_err:
                 logging.error(f"Error sorting placeholders numerically: {sort_err}. Using default sort.")
                 sorted_placeholders = sorted(placeholder_map.keys())
 
+            final_text_list = list(final_text) # Work with list for efficient replacement? Or use string replace..
+            current_offset = 0 # Track index changes if using list replace
+
+            # Use string replace for simplicity, iterate multiple times if needed for overlaps (though shouldn't happen with sorted longest first)
             for placeholder in sorted_placeholders:
                 original_term = placeholder_map[placeholder]
+                # Replace placeholder with " original_term " to ensure spacing, will clean later
+                # Count occurrences before replacing for logging
                 occurrences = final_text.count(placeholder)
                 if occurrences > 0:
                     final_text = final_text.replace(placeholder, f" {original_term} ")
                     num_reinserted += occurrences
+
             logging.info(f"{num_reinserted} placeholder instance(s) re-inserted.")
+
+            # Clean up potential double spaces and spaces around punctuation AFTER all replacements
             final_text = re.sub(r'\s{2,}', ' ', final_text).strip()
-            final_text = re.sub(r'\s+([.,;?!:])', r'\1', final_text)
-            final_text = re.sub(r'([.,;?!:])([^\s])', r'\1 \2', final_text)
+            final_text = re.sub(r'\s+([.,;?!:])', r'\1', final_text) # Space before punct
+            final_text = re.sub(r'([.,;?!:])([^\s])', r'\1 \2', final_text) # Punct followed by non-space
+
         else:
             logging.info("No placeholders were used, skipping re-insertion.")
 
-        # --- Final Metrics Calculation (AI Score Removed) ---
-        logging.info("Calculating final metrics (excluding AI score)...")
-        # REMOVED: paraphrased_ai_score initialization
-        paraphrased_fk_score, paraphrased_burstiness, paraphrased_ttr, paraphrased_word_count, paraphrased_mod_percentage = 0.0, 0.0, 0.0, 0, 0.0
-        # REMOVED: paraphrased_ai_result initialization
+
+        # --- Final Metrics Calculation ---
+        logging.info("Calculating final metrics...")
+        paraphrased_ai_score, paraphrased_fk_score, paraphrased_burstiness, paraphrased_ttr, paraphrased_word_count, paraphrased_mod_percentage = 0.0, 0.0, 0.0, 0.0, 0, 0.0
+        paraphrased_ai_result = {'label': 'N/A', 'score': 0.0}
 
         if final_text and final_text.strip():
-            # --- AI Detector Calculation Block REMOVED ---
-            # try:
-            #     # ... (truncation logic was here) ...
-            #     # paraphrased_ai_result = detector_pipeline(truncated_text)[0] # Call was here
-            #     # paraphrased_ai_score = paraphrased_ai_result.get('score', 0.0) # Assignment was here
-            # except Exception as ai_err:
-            #     logging.error(f"Error calculating final AI score: {ai_err}", exc_info=True);
-            #     # paraphrased_ai_result = {'label': 'Error', 'score': 0.0} # Default setting was here
+            try:
+                # Use the AI detector pipeline loaded earlier
+                # Truncate input to AI detector if necessary (check model's max length)
+                # detector_max_len = models["ai_detector"].model.config.max_position_embeddings
+                # truncated_final_text = models["ai_detector"].tokenizer.decode(models["ai_detector"].tokenizer.encode(final_text, max_length=detector_max_len, truncation=True))
+                # paraphrased_ai_result = models["ai_detector"](truncated_final_text)[0]
+
+                # Assuming detector handles truncation internally or text is within limits:
+                paraphrased_ai_result = models["ai_detector"](final_text)[0]
+                paraphrased_ai_score = paraphrased_ai_result.get('score', 0.0)
+            except Exception as ai_err: logging.error(f"Error calculating final AI score: {ai_err}", exc_info=True); paraphrased_ai_result = {'label': 'Error', 'score': 0.0}
 
             try: paraphrased_fk_score = flesch_kincaid_grade(final_text)
             except Exception as fk_err: logging.error(f"Error calculating final FK score: {fk_err}")
 
             paraphrased_burstiness = calculate_burstiness(final_text)
             paraphrased_ttr = calculate_ttr(final_text)
-            paraphrased_word_count = len(final_text.split())
+            paraphrased_word_count = len(final_text.split()) # Simple word count
             paraphrased_mod_percentage = calculate_modification_percentage(input_text, final_text)
-            logging.info("Final metrics calculated (excluding AI score).")
+            logging.info("Final metrics calculated.")
         else:
             logging.warning("Final text is empty. Setting final metrics to default values.")
 
 
         # --- Final Freeze Term Preservation Check ---
         final_freeze_terms_preserved = True
-        if placeholder_map:
+        if placeholder_map: # Only check if placeholders were supposed to be there
             logging.info(f"Verifying placeholder removal in final output...")
             if PLACEHOLDER_PATTERN.search(final_text):
                 remaining_found = PLACEHOLDER_PATTERN.findall(final_text)
@@ -1119,15 +1165,17 @@ def process_text(
                 logging.info("All placeholders appear to have been removed/replaced successfully.")
         else:
             logging.info("No freeze terms were used, skipping final verification.")
+            # final_freeze_terms_preserved remains True
 
 
-        # --- Structure Output Data (AI Score Removed) ---
+        # --- Structure Output Data ---
         output_data = {
             "status": "success",
+            # Renamed key for clarity based on your variable name
             "final_text": final_text,
             "final_metrics": {
-                # REMOVED: "ai_score_label": ...,
-                # REMOVED: "ai_score_value": ...,
+                "ai_score_label": paraphrased_ai_result.get('label', 'N/A'),
+                "ai_score_value": round(paraphrased_ai_score, 4),
                 "flesch_kincaid_grade": round(paraphrased_fk_score, 1),
                 "burstiness_score": round(paraphrased_burstiness, 4),
                 "type_token_ratio": round(paraphrased_ttr, 4),
@@ -1135,6 +1183,7 @@ def process_text(
                 "word_count": paraphrased_word_count,
                 "freeze_terms_preserved": final_freeze_terms_preserved
             }
+            # Removed intermediate results keys as per your optimization comment
         }
         end_process_time = time.time()
         logging.info(f"--- Processing Finished (Request Time: {end_process_time - start_process_time:.2f} seconds) ---")
@@ -1142,8 +1191,11 @@ def process_text(
 
     except Exception as e:
         logging.exception("An unexpected error occurred during core text processing:") # Log full traceback
+        # Return a structured error message
         return {'status': 'error', 'message': f"An unexpected processing error occurred: {str(e)}"}
 
+
+# >>> START OF PART 4 <<<
 
 # ==============================================================================
 # 10. FLASK APP INITIALIZATION
@@ -1151,11 +1203,16 @@ def process_text(
 app = Flask(__name__)
 CORS(app) # Enable CORS for all routes - configure origins properly for production
 
+# Optional: Configure Flask settings if needed (e.g., SECRET_KEY for sessions)
+# app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'default-secret-key-change-me')
+
+
 # ==============================================================================
 # 11. GLOBAL MODEL LOADING (Executed once when Flask app/worker starts)
 # ==============================================================================
+# >>> THIS IS WHERE MODELS ARE LOADED GLOBALLY <<<
 logging.info("Initializing Flask app and loading models...")
-# Call the modified model loading function (Section 8)
+# Call the model loading function defined in Section 8
 loaded_models_global = load_models(device_preference=CONFIG.get("default_device", "auto"))
 
 if not loaded_models_global:
@@ -1164,6 +1221,8 @@ if not loaded_models_global:
     logging.critical("The /humanize endpoint will return an error until models load successfully.")
     logging.critical("Check logs above for specific model loading errors.")
     logging.critical("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    # The application will start, but the endpoint will check loaded_models_global
+    # and return an error if it's None.
 else:
     logging.info("********************************************************")
     logging.info("Global models loaded successfully. Flask app is ready.")
@@ -1174,8 +1233,11 @@ else:
 # ==============================================================================
 # 12. FLASK API ENDPOINTS
 # ==============================================================================
+
+# Basic root endpoint for testing if the server is reachable
 @app.route('/', methods=['GET', 'POST'])
 def index():
+    # Simple check endpoint
     method = request.method
     logging.info(f"Root endpoint '/' received a {method} request.")
     return jsonify({"status": "ok", "message": f"TextPulse backend alive. Received {method}."}), 200
@@ -1187,58 +1249,72 @@ def humanize_endpoint():
     start_request_time = time.time()
     logging.info(f"Received request for /humanize from {request.remote_addr}")
 
+    # --- CRITICAL CHECK: Ensure models loaded successfully at startup ---
     if not loaded_models_global:
         logging.error("Models were not loaded during startup, cannot process request.")
+        # Return 503 Service Unavailable, as the service is fundamentally not ready
         return jsonify({"status": "error", "message": "Service Unavailable: Backend models failed to load."}), 503
 
+    # --- Get and Validate Input Data ---
     if not request.is_json:
         logging.warning("Request Content-Type is not application/json.")
-        return jsonify({"status": "error", "message": "Invalid request format: Content-Type must be application/json"}), 415
+        return jsonify({"status": "error", "message": "Invalid request format: Content-Type must be application/json"}), 415 # Unsupported Media Type
 
     data = request.get_json()
     if not data:
         logging.warning("Received empty JSON payload.")
-        return jsonify({"status": "error", "message": "No input data received"}), 400
+        return jsonify({"status": "error", "message": "No input data received"}), 400 # Bad Request
 
     input_text = data.get('text')
     discipline = data.get('discipline', DEFAULT_DISCIPLINE)
     freeze_terms = data.get('freeze_terms', [])
 
-    if not input_text:
+    # --- Basic Input Validation ---
+    if not input_text: # Check if text exists and is not just whitespace
         logging.warning("Request missing 'text' field or text is empty.")
         return jsonify({"status": "error", "message": "Input 'text' is required and cannot be empty"}), 400
     if not isinstance(freeze_terms, list):
         logging.warning(f"Received 'freeze_terms' is not a list (Type: {type(freeze_terms)}).")
         return jsonify({"status": "error", "message": "'freeze_terms' must be a list of strings"}), 400
+    # Ensure all freeze terms are strings (or handle potential errors)
     if not all(isinstance(term, str) for term in freeze_terms):
          logging.warning("Received 'freeze_terms' contains non-string elements.")
          return jsonify({"status": "error", "message": "'freeze_terms' must be a list of strings"}), 400
+
     if discipline not in VALID_DISCIPLINES:
         logging.warning(f"Received invalid discipline '{discipline}', using default '{DEFAULT_DISCIPLINE}'.")
         discipline = DEFAULT_DISCIPLINE
 
+
+    # --- Call Core Processing Logic ---
     try:
+        # Pass the globally loaded models dictionary
         result_dict = process_text(
             input_text=input_text,
             freeze_terms=freeze_terms,
             discipline=discipline,
-            models=loaded_models_global,
+            models=loaded_models_global, # Use the models loaded at startup
             config=CONFIG
         )
 
+        # --- Prepare and Return Response ---
         if result_dict.get("status") == "success":
-            # Output structure remains the same, but final_metrics won't contain AI score keys
+            # Return only the final text and metrics as specified
             response_data = {
                 "status": "success",
-                "final_text": result_dict.get("final_text", ""),
+                "final_text": result_dict.get("final_text", ""), # Use the correct key from process_text output
                 "final_metrics": result_dict.get("final_metrics", {})
             }
             status_code = 200
         else:
+            # Pass through the error message from process_text
             response_data = {
                 "status": "error",
                 "message": result_dict.get('message', 'Unknown processing error')
             }
+            # Determine status code based on error type if possible
+            # 422: Unprocessable Entity (validation errors within process_text)
+            # 500: Internal Server Error (unexpected errors)
             msg_lower = response_data['message'].lower()
             if "word limit" in msg_lower or "token limit" in msg_lower or "no valid sentences" in msg_lower:
                  status_code = 422
@@ -1250,7 +1326,9 @@ def humanize_endpoint():
         return jsonify(response_data), status_code
 
     except Exception as e:
-        logging.exception("An unexpected error occurred within the /humanize endpoint:")
+        # Catch-all for unexpected errors *within the endpoint logic itself*
+        # Errors within process_text should be caught and returned by that function.
+        logging.exception("An unexpected error occurred within the /humanize endpoint:") # Log full traceback
         return jsonify({"status": "error", "message": f"An internal server error occurred while handling the request."}), 500
 
 
@@ -1258,8 +1336,11 @@ def humanize_endpoint():
 # 13. MAIN EXECUTION BLOCK (For Running the Server Directly)
 # ==============================================================================
 if __name__ == '__main__':
+    # This block runs only when the script is executed directly (e.g., `python your_script.py`)
+    # It's primarily for local development and testing.
+
     print("\n" + "="*60)
-    print("--- TextPulse Flask Server (No AI Detector) ---") # Updated Title
+    print("--- TextPulse Flask Server ---")
     print("="*60)
     print("\n >> Running in direct execution mode (for development/testing) <<\n")
 
@@ -1267,8 +1348,8 @@ if __name__ == '__main__':
     print(" For production (e.g., on DigitalOcean with Gunicorn):")
     print(" 1. Ensure Gunicorn is installed: pip install gunicorn")
     print(" 2. Run using a command like:")
-    # Updated example to use 'main:app'
-    print("    gunicorn --workers 2 --threads 2 --bind 0.0.0.0:5001 --timeout 180 main:app")
+    # Assuming your script is named 'app.py'. Change 'app:app' if filename or Flask app variable name differs.
+    print("    gunicorn --workers 2 --threads 2 --bind 0.0.0.0:5000 app:app --timeout 120")
     print("    - Adjust '--workers' (processes) based on CPU cores (e.g., 2*cores + 1).")
     print("    - Adjust '--threads' (per worker) based on workload (start with 2-4).")
     print("    - Adjust '--timeout' (seconds) if requests take longer (default is 30s).")
@@ -1276,22 +1357,24 @@ if __name__ == '__main__':
     print("    - Consider running behind a reverse proxy like Nginx.")
     print(" -----------------------------")
 
-    flask_debug_mode = False
-    flask_port = 5001
+    # Run the Flask development server
+    # Set debug=False to mimic production loading behavior more closely (no auto-reload)
+    # Set debug=True for auto-reloading on code changes during active development (will reload models on change).
+    flask_debug_mode = False # Set to True only for active code modification testing
+    flask_port = 5001 # Use a distinct port for development server
 
     print(f"\nStarting Flask development server on http://0.0.0.0:{flask_port}/")
     print(f" --> DEBUG MODE: {'ON (Auto-reload enabled)' if flask_debug_mode else 'OFF (Production-like loading)'} <--")
     print(" (Use Ctrl+C to stop)")
     print("="*60 + "\n")
 
+    # Note: app.run() is NOT suitable for production deployment.
     app.run(debug=flask_debug_mode, host='0.0.0.0', port=flask_port)
 
 # ==============================================================================
 # 14. FINAL SCRIPT DOCSTRING (Redundant if top one is detailed)
 # ==============================================================================
 """
-End of TextPulse.ai Flask Backend Script (No AI Detector).
+End of TextPulse.ai Flask Backend Script.
 Provides the /humanize API endpoint with pre-loaded ML models.
 """
-
-# --- END OF PART 3 ---
