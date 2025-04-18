@@ -7,7 +7,7 @@ Processing Flow: Input -> Preprocess -> T5 (Sentence-by-Sentence) -> Splitter ->
 Uses humarin/t5-base, num_beams=5.
 Logging reduced to show key intermediate outputs at INFO level.
 Configured for local testing (Flask debug=True).
-**MODIFIED: Sentence splitter logic improved based on safety analysis.**
+**MODIFIED: Sentence splitter logic improved based on safety analysis.**  
 """
 
 # ==============================================================================
@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 try:
     import spacy
     import torch
-    import transformers # Still needed for T5
+    import transformers 
     import openai
     from textstat import flesch_kincaid_grade
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, set_seed
