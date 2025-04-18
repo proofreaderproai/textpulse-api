@@ -58,7 +58,7 @@ DEBUG_SPLITTING = False # Set to False for reduced verbosity
 # --- Model & Processing Parameters ---
 CONFIG = {
     "spacy_model": "en_core_web_sm",
-    "paraphraser_model": "humarin/chatgpt_paraphraser_on_T5_base", #  t5-small # humarin/chatgpt_paraphraser_on_T5_base
+    "paraphraser_model": "humarin/chatgpt_paraphraser_on_T5_base", # t5-small # humarin/chatgpt_paraphraser_on_T5_base
     "default_device": "auto",
     "paraphrase_num_beams": 5, # Using beam search=5
     "paraphrase_max_length": 512,
