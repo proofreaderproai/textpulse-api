@@ -1,0 +1,9 @@
+Flask
+Flask-Caching
+Flask-Cors
+python-dotenv
+spacy
+torch
+transformers
+openai
+textstat
